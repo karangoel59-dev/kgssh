@@ -1,6 +1,10 @@
 package main
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -33,7 +37,7 @@ func TestLoadConfig(t *testing.T) {
 
 func TestBuildSSHClientConfig(t *testing.T) {
 	entry := entry{User: "deploy", Host: "server.internal", Port: 2222, Password: "secret"}
-	cfg, err := buildSSHClientConfig(entry)
+	cfg, err := buildSSHClientConfig(entry, "")
 	if err != nil {
 		t.Fatalf("buildSSHClientConfig returned error: %v", err)
 	}
@@ -46,4 +50,76 @@ func TestBuildSSHClientConfig(t *testing.T) {
 	if cfg.HostKeyCallback == nil {
 		t.Fatalf("expected host key callback to be set")
 	}
+}
+
+func TestBuildSSHClientConfigExpandsHomeInIdentityPath(t *testing.T) {
+	tempHome := t.TempDir()
+	oldHome := os.Getenv("HOME")
+	if err := os.Setenv("HOME", tempHome); err != nil {
+		t.Fatalf("set HOME: %v", err)
+	}
+	if oldHome == "" {
+		defer os.Unsetenv("HOME")
+	} else {
+		defer os.Setenv("HOME", oldHome)
+	}
+
+	if _, err := writeTempSSHPrivateKey(t, tempHome, "id_rsa_chat360"); err != nil {
+		t.Fatalf("write SSH private key: %v", err)
+	}
+
+	entry := entry{User: "deploy", Host: "server.internal", ExtraArgs: []string{"-i", "~/id_rsa_chat360"}}
+	cfg, err := buildSSHClientConfig(entry, "")
+	if err != nil {
+		t.Fatalf("buildSSHClientConfig returned error: %v", err)
+	}
+	if len(cfg.Auth) != 1 {
+		t.Fatalf("expected one auth method, got %d", len(cfg.Auth))
+	}
+}
+
+func TestBuildSSHClientConfigFallsBackToDotSSHDir(t *testing.T) {
+	tempHome := t.TempDir()
+	oldHome := os.Getenv("HOME")
+	if err := os.Setenv("HOME", tempHome); err != nil {
+		t.Fatalf("set HOME: %v", err)
+	}
+	if oldHome == "" {
+		defer os.Unsetenv("HOME")
+	} else {
+		defer os.Setenv("HOME", oldHome)
+	}
+
+	dotSSH := filepath.Join(tempHome, ".ssh")
+	if err := os.Mkdir(dotSSH, 0o700); err != nil {
+		t.Fatalf("create .ssh dir: %v", err)
+	}
+	if _, err := writeTempSSHPrivateKey(t, dotSSH, "id_rsa_chat360"); err != nil {
+		t.Fatalf("write SSH private key: %v", err)
+	}
+
+	entry := entry{User: "deploy", Host: "server.internal", ExtraArgs: []string{"-i", "id_rsa_chat360"}}
+	cfg, err := buildSSHClientConfig(entry, "")
+	if err != nil {
+		t.Fatalf("buildSSHClientConfig returned error: %v", err)
+	}
+	if len(cfg.Auth) != 1 {
+		t.Fatalf("expected one auth method, got %d", len(cfg.Auth))
+	}
+}
+
+func writeTempSSHPrivateKey(t *testing.T, dir, fileName string) (string, error) {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return "", err
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(priv),
+	})
+	path := filepath.Join(dir, fileName)
+	if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
+		return "", err
+	}
+	return path, nil
 }

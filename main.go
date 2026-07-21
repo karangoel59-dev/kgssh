@@ -31,6 +31,8 @@ func newRootCommand() *cobra.Command {
     root.AddCommand(newConnectCommand())
     root.AddCommand(newAddCommand())
     root.AddCommand(newRemoveCommand())
+    root.AddCommand(newSetKeysDirCommand())
+    root.AddCommand(newShowConfigCommand())
     return root
 }
 
@@ -72,7 +74,7 @@ func newConnectCommand() *cobra.Command {
                 return fmt.Errorf("unknown server: %s", args[0])
             }
 
-            clientConfig, err := buildSSHClientConfig(entry)
+            clientConfig, err := buildSSHClientConfig(entry, cfg.KeysDir)
             if err != nil {
                 return fmt.Errorf("ssh config error: %w", err)
             }
@@ -110,6 +112,9 @@ func newAddCommand() *cobra.Command {
             }
             if host == "" {
                 return fmt.Errorf("host is required")
+            }
+            if port == 0 {
+                port = 22
             }
 
             configPath := resolveConfigPath()
@@ -178,6 +183,52 @@ func newRemoveCommand() *cobra.Command {
     }
 }
 
+func newSetKeysDirCommand() *cobra.Command {
+    return &cobra.Command{
+        Use:   "set-keys-dir <dir>",
+        Short: "Set the SSH keys directory for bare identity filenames",
+        Args:  cobra.ExactArgs(1),
+        RunE: func(cmd *cobra.Command, args []string) error {
+            configPath := resolveConfigPath()
+            cfg, err := loadConfig(configPath)
+            if err != nil {
+                if !os.IsNotExist(err) {
+                    return fmt.Errorf("load config: %w", err)
+                }
+                cfg = config{Entries: map[string]entry{}}
+            }
+            if cfg.Entries == nil {
+                cfg.Entries = map[string]entry{}
+            }
+            cfg.KeysDir = args[0]
+            if err := saveConfig(configPath, cfg); err != nil {
+                return err
+            }
+            fmt.Printf("SSH keys directory set to %q\n", args[0])
+            return nil
+        },
+    }
+}
+
+func newShowConfigCommand() *cobra.Command {
+    return &cobra.Command{
+        Use:   "show-config",
+        Short: "Show the current kgssh configuration",
+        RunE: func(cmd *cobra.Command, args []string) error {
+            cfg, err := loadConfig(resolveConfigPath())
+            if err != nil {
+                return err
+            }
+            data, err := json.MarshalIndent(cfg, "", "  ")
+            if err != nil {
+                return fmt.Errorf("encode config: %w", err)
+            }
+            fmt.Println(string(data))
+            return nil
+        },
+    }
+}
+
 func resolveConfigPath() string {
     if path := os.Getenv("KGSSH_CONFIG"); path != "" {
         return path
@@ -191,6 +242,7 @@ func resolveConfigPath() string {
 
 type config struct {
     Entries map[string]entry `json:"entries"`
+    KeysDir string           `json:"keysDir,omitempty"`
 }
 
 type entry struct {
@@ -271,7 +323,7 @@ func connectWithNativeSSH(entry entry, clientConfig *ssh.ClientConfig) error {
     return nil
 }
 
-func buildSSHClientConfig(entry entry) (*ssh.ClientConfig, error) {
+func buildSSHClientConfig(entry entry, keysDir string) (*ssh.ClientConfig, error) {
     clientConfig := &ssh.ClientConfig{
         User:            entry.User,
         HostKeyCallback: ssh.InsecureIgnoreHostKey(),
@@ -289,7 +341,7 @@ func buildSSHClientConfig(entry entry) (*ssh.ClientConfig, error) {
         if i+1 >= len(entry.ExtraArgs) {
             return nil, fmt.Errorf("missing path for identity file")
         }
-        signer, err := loadSSHPrivateKey(entry.ExtraArgs[i+1])
+        signer, err := loadSSHPrivateKey(entry.ExtraArgs[i+1], keysDir)
         if err != nil {
             return nil, fmt.Errorf("load identity %q: %w", entry.ExtraArgs[i+1], err)
         }
@@ -301,10 +353,58 @@ func buildSSHClientConfig(entry entry) (*ssh.ClientConfig, error) {
     return clientConfig, nil
 }
 
-func loadSSHPrivateKey(path string) (ssh.Signer, error) {
-    data, err := os.ReadFile(path)
-    if err != nil {
-        return nil, err
+func loadSSHPrivateKey(path, keysDir string) (ssh.Signer, error) {
+    expanded := expandPath(path)
+    data, err := os.ReadFile(expanded)
+    if err == nil {
+        return ssh.ParsePrivateKey(data)
     }
-    return ssh.ParsePrivateKey(data)
+
+    if fallback := sshFallbackPath(expanded, keysDir); fallback != "" {
+        data, err2 := os.ReadFile(fallback)
+        if err2 == nil {
+            return ssh.ParsePrivateKey(data)
+        }
+    }
+
+    return nil, err
+}
+
+func sshFallbackPath(path, keysDir string) string {
+    if filepath.IsAbs(path) {
+        return ""
+    }
+    if strings.Contains(path, string(os.PathSeparator)) {
+        return ""
+    }
+    if keysDir == "" {
+        if home := userHomeDir(); home != "" {
+            return filepath.Join(home, ".ssh", path)
+        }
+        return ""
+    }
+    return filepath.Join(expandPath(keysDir), path)
+}
+
+func expandPath(path string) string {
+    if path == "~" {
+        if home := userHomeDir(); home != "" {
+            return home
+        }
+        return path
+    }
+    if strings.HasPrefix(path, "~/") {
+        if home := userHomeDir(); home != "" {
+            return filepath.Join(home, path[2:])
+        }
+    }
+    return path
+}
+
+func userHomeDir() string {
+    home, err := os.UserHomeDir()
+    if err == nil && home != "" {
+        return home
+    }
+    return os.Getenv("HOME")
 }
