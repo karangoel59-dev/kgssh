@@ -108,6 +108,28 @@ func TestBuildSSHClientConfigFallsBackToDotSSHDir(t *testing.T) {
 	}
 }
 
+func TestBuildSSHClientConfigUsesDefaultIdentityFiles(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	dotSSH := filepath.Join(tempHome, ".ssh")
+	if err := os.Mkdir(dotSSH, 0o700); err != nil {
+		t.Fatalf("create .ssh dir: %v", err)
+	}
+	if _, err := writeTempSSHPrivateKey(t, dotSSH, "id_rsa"); err != nil {
+		t.Fatalf("write SSH private key: %v", err)
+	}
+
+	entry := entry{User: "deploy", Host: "server.internal"}
+	cfg, err := buildSSHClientConfig(entry, "")
+	if err != nil {
+		t.Fatalf("buildSSHClientConfig returned error: %v", err)
+	}
+	if len(cfg.Auth) != 1 {
+		t.Fatalf("expected one auth method, got %d", len(cfg.Auth))
+	}
+}
+
 func writeTempSSHPrivateKey(t *testing.T, dir, fileName string) (string, error) {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {

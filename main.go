@@ -349,6 +349,16 @@ func buildSSHClientConfig(entry entry, keysDir string) (*ssh.ClientConfig, error
         i++
     }
 
+    if len(authMethods) == 0 {
+        for _, candidate := range []string{"id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"} {
+            signer, err := loadSSHPrivateKey(candidate, keysDir)
+            if err != nil {
+                continue
+            }
+            authMethods = append(authMethods, ssh.PublicKeys(signer))
+        }
+    }
+
     clientConfig.Auth = authMethods
     return clientConfig, nil
 }
