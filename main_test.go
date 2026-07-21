@@ -31,11 +31,19 @@ func TestLoadConfig(t *testing.T) {
 	}
 }
 
-func TestBuildSSHArgs(t *testing.T) {
-	entry := entry{User: "deploy", Host: "server.internal", Port: 2222, ExtraArgs: []string{"-i", "/tmp/id_rsa"}}
-	args := buildSSHArgs(entry)
-	want := []string{"-o", "BatchMode=yes", "-p", "2222", "-i", "/tmp/id_rsa", "deploy@server.internal"}
-	if !reflect.DeepEqual(args, want) {
-		t.Fatalf("unexpected args: %#v", args)
+func TestBuildSSHClientConfig(t *testing.T) {
+	entry := entry{User: "deploy", Host: "server.internal", Port: 2222, Password: "secret"}
+	cfg, err := buildSSHClientConfig(entry)
+	if err != nil {
+		t.Fatalf("buildSSHClientConfig returned error: %v", err)
+	}
+	if cfg.User != "deploy" {
+		t.Fatalf("user mismatch: got %q", cfg.User)
+	}
+	if len(cfg.Auth) != 1 {
+		t.Fatalf("expected one auth method, got %d", len(cfg.Auth))
+	}
+	if cfg.HostKeyCallback == nil {
+		t.Fatalf("expected host key callback to be set")
 	}
 }
