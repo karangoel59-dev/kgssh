@@ -1,71 +1,154 @@
 # kgssh
 
-A small Go CLI for launching SSH connections from named config entries.
+**kgssh** is a hybrid SSH Alias Manager for macOS and Linux. It lets you define named SSH connections, exports them as native shell functions/aliases (with argument and command forwarding), syncs them to your active shell (`zsh`, `bash`, `fish`), and provides a direct runner CLI.
+
+---
+
+## Features
+
+- **Native Shell Functions & Aliases**: Generates functions like `prod1() { ssh ... "$@"; }` allowing direct terminal usage (`prod1`, `prod1 "ls -la"`, `prod1 -L 8080:localhost:8080`).
+- **Hybrid CLI & Shell**:
+  - Run directly via shell: `prod1`
+  - Run via CLI: `kgssh prod1` or `kgssh run prod1`
+  - Inspect resolved command: `kgssh cmd prod1`
+- **Automatic Syncing**: Any `kgssh add` or `kgssh remove` automatically refreshes `~/.kgssh/aliases.sh`.
+- **Cross-Platform Identity Resolution**: Automatically detects and heals key paths across environments (e.g. Linux `/home/...` to macOS `~/.ssh/...`).
+- **OpenSSH Import**: Easily import existing `Host` blocks from `~/.ssh/config` using `kgssh import-ssh-config`.
+- **Full OpenSSH Compatibility**: Leverages your system `ssh` binary directly, ensuring full support for agent forwarding, tmux, vim, escape sequences, and native PTY.
+
+---
+
+## Quick Start & Shell Setup
+
+To install the aliases into your current shell (`~/.zshrc` or `~/.bashrc`), simply run:
+
+```bash
+kgssh sync --install
+```
+
+This generates `~/.kgssh/aliases.sh` and adds the source line to your shell configuration:
+```bash
+[ -f ~/.kgssh/aliases.sh ] && source ~/.kgssh/aliases.sh
+```
+
+Alternatively, add dynamic evaluation to `~/.zshrc`:
+```bash
+eval "$(kgssh init)"
+```
+
+---
 
 ## Commands
 
-### `kgssh add`
-
-Add a new SSH connection entry to the config file.
-
+### 1. List Aliases
 ```bash
-./kgssh add <name> <user@host> [--port <port>] [--extra-arg <arg>...]
+# Formatted table view
+kgssh list
+
+# Show raw SSH command lines
+kgssh list -c
+
+# Output alias names only (for scripts / completions)
+kgssh list -q
+
+# Output JSON
+kgssh list --json
 ```
 
-Examples:
-
+### 2. Add / Update an Alias
 ```bash
-./kgssh add prod ubuntu@prod.example.com --port 2222 --extra-arg '-i' --extra-arg '/path/to/id_rsa'
-./kgssh add staging --user deploy --host staging.example.com --port 2200
+# Syntax: kgssh add <alias> [user@host[:port]] [flags]
+kgssh add web ubuntu@192.168.1.100 -p 2222 -i ~/.ssh/id_rsa -d "Primary web node"
+kgssh add jump admin@jump.example.com -J bastion
+kgssh add staging root@staging.internal
 ```
 
-### `kgssh connect`
+Flags:
+- `-u, --user`: SSH username
+- `-H, --host`: SSH host / IP
+- `-p, --port`: SSH port (default 22)
+- `-i, --identity`: Private key file path
+- `-J, --proxy-jump`: Proxy jump target
+- `-d, --description`: Description for the alias
+- `-P, --password`: SSH password (for sshpass wrapper if installed)
+- `--extra-arg`: Arbitrary extra SSH flags
 
-Connect to a configured SSH server by alias.
-
+### 3. Show Details / Raw Command
 ```bash
-./kgssh connect prod
+# Full details
+kgssh show prod1
+
+# Raw runnable command string (great for piping to pbcopy)
+kgssh cmd prod1
+kgssh cmd prod1 | pbcopy
 ```
 
-### `kgssh list`
-
-List all configured SSH servers.
-
+### 4. Run / Connect via CLI
 ```bash
-./kgssh list
+# Interactive shell
+kgssh prod1
+# or
+kgssh run prod1
+
+# Execute remote command
+kgssh prod1 "sudo systemctl restart nginx"
+# or
+kgssh run prod1 uptime
 ```
+
+### 5. Remove an Alias
+```bash
+kgssh remove prod1
+# or
+kgssh rm prod1
+```
+
+### 6. Sync Aliases to Shell File
+```bash
+# Syncs to ~/.kgssh/aliases.sh
+kgssh sync
+
+# Sync and automatically hook into ~/.zshrc or ~/.bashrc
+kgssh sync --install
+```
+
+### 7. Import from `~/.ssh/config`
+```bash
+# Preview what would be imported
+kgssh import-ssh-config --dry-run
+
+# Import hosts
+kgssh import-ssh-config
+
+# Overwrite existing aliases if duplicate names match
+kgssh import-ssh-config --overwrite
+```
+
+---
 
 ## Configuration
 
-By default, kgssh stores configuration at:
-
-```bash
-~/.kgssh/config.json
-```
-
-You can override the config path with:
-
-```bash
-export KGSSH_CONFIG=~/my-config.json
-```
-
-### Example config file
+Stored in `~/.kgssh/config.json` (or override with `KGSSH_CONFIG` environment variable):
 
 ```json
 {
   "entries": {
-    "prod": {
-      "user": "ubuntu",
-      "host": "prod.example.com",
-      "port": 2222,
-      "extraArgs": ["-i", "/path/to/id_rsa"]
+    "prod1": {
+      "user": "root",
+      "host": "159.89.171.7",
+      "port": 22,
+      "identity": "~/.ssh/dev_chat360"
     }
-  }
+  },
+  "keysDir": "~/.ssh"
 }
 ```
 
-## Build
+---
+
+## Building & Testing
 
 ```bash
+go test -v ./...
 go build -o kgssh .
 ```

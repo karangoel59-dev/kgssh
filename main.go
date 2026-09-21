@@ -3,16 +3,38 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"net"
 	"os"
-	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"text/tabwriter"
 
 	"github.com/spf13/cobra"
-	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/agent"
 )
+
+var builtinCommands = map[string]bool{
+	"add":               true,
+	"remove":            true,
+	"rm":                true,
+	"list":              true,
+	"ls":                true,
+	"show":              true,
+	"get":               true,
+	"cmd":               true,
+	"command":           true,
+	"run":               true,
+	"connect":           true,
+	"exec":              true,
+	"export":            true,
+	"env":               true,
+	"init":              true,
+	"sync":              true,
+	"import-ssh-config": true,
+	"set-keys-dir":      true,
+	"show-config":       true,
+	"help":              true,
+	"completion":        true,
+}
 
 func main() {
 	if err := newRootCommand().Execute(); err != nil {
@@ -22,97 +44,266 @@ func main() {
 }
 
 func newRootCommand() *cobra.Command {
+	cfg, _ := loadConfig(resolveConfigPath())
+
 	root := &cobra.Command{
-		Use:   "kgssh",
-		Short: "Launch SSH connections from named config entries",
-		Long:  "kgssh connects to SSH targets defined in a JSON config file.",
+		Use:   "kgssh [command|alias] [args...]",
+		Short: "SSH alias manager — configure, generate, and run SSH aliases",
+		Long: `kgssh is an SSH alias manager.
+It organizes named SSH targets, exports them as native shell functions/aliases
+for zsh and bash, syncs them to your environment, and provides a direct runner.`,
+		Args: cobra.ArbitraryArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				return cmd.Help()
+			}
+			aliasName := args[0]
+			entry, ok := cfg.Entries[aliasName]
+			if !ok {
+				return fmt.Errorf("unknown command or alias: %q\nRun 'kgssh list' to see configured aliases", aliasName)
+			}
+			return RunSSH(entry, cfg.KeysDir, args[1:])
+		},
 	}
 
 	root.AddCommand(newListCommand())
-	root.AddCommand(newConnectCommand())
+	root.AddCommand(newShowCommand())
+	root.AddCommand(newCommandCommand())
 	root.AddCommand(newAddCommand())
 	root.AddCommand(newRemoveCommand())
+	root.AddCommand(newRunCommand())
+	root.AddCommand(newConnectCommand())
+	root.AddCommand(newExportCommand())
+	root.AddCommand(newInitCommand())
+	root.AddCommand(newSyncCommand())
+	root.AddCommand(newImportSSHConfigCommand())
 	root.AddCommand(newSetKeysDirCommand())
 	root.AddCommand(newShowConfigCommand())
+
+	// Dynamically register aliases as runnable subcommands for shell completion & direct execution
+	for name, entry := range cfg.Entries {
+		if builtinCommands[name] {
+			continue
+		}
+		targetName := name
+		targetEntry := entry
+		aliasCmd := &cobra.Command{
+			Use:                targetName + " [flags/remote-args...]",
+			Short:              fmt.Sprintf("Connect to %s (%s)", targetName, targetEntry.Host),
+			DisableFlagParsing: true,
+			RunE: func(cmd *cobra.Command, args []string) error {
+				return RunSSH(targetEntry, cfg.KeysDir, args)
+			},
+		}
+		root.AddCommand(aliasCmd)
+	}
+
 	return root
 }
 
 func newListCommand() *cobra.Command {
+	var raw, showCmds, asJSON bool
+
+	cmd := &cobra.Command{
+		Use:     "list",
+		Aliases: []string{"ls"},
+		Short:   "List configured SSH aliases",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig(resolveConfigPath())
+			if err != nil {
+				if os.IsNotExist(err) || len(cfg.Entries) == 0 {
+					fmt.Println("No configured SSH aliases. Use 'kgssh add <name> <user@host>' to add one.")
+					return nil
+				}
+				return err
+			}
+
+			if len(cfg.Entries) == 0 {
+				fmt.Println("No configured SSH aliases. Use 'kgssh add <name> <user@host>' to add one.")
+				return nil
+			}
+
+			names := make([]string, 0, len(cfg.Entries))
+			for name := range cfg.Entries {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+
+			if asJSON {
+				data, err := json.MarshalIndent(cfg.Entries, "", "  ")
+				if err != nil {
+					return err
+				}
+				fmt.Println(string(data))
+				return nil
+			}
+
+			if raw {
+				for _, name := range names {
+					fmt.Println(name)
+				}
+				return nil
+			}
+
+			w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+			if showCmds {
+				fmt.Fprintln(w, "ALIAS\tCOMMAND")
+				fmt.Fprintln(w, "-----\t-------")
+				for _, name := range names {
+					entry := cfg.Entries[name]
+					cmdStr := BuildSSHCommandString(name, entry, cfg.KeysDir)
+					fmt.Fprintf(w, "%s\t%s\n", name, cmdStr)
+				}
+			} else {
+				fmt.Fprintln(w, "ALIAS\tTARGET\tIDENTITY\tDESCRIPTION")
+				fmt.Fprintln(w, "-----\t------\t--------\t-----------")
+				for _, name := range names {
+					entry := cfg.Entries[name]
+					target := entry.Host
+					if entry.User != "" {
+						target = entry.User + "@" + entry.Host
+					}
+					if entry.Port > 0 && entry.Port != 22 {
+						target = fmt.Sprintf("%s:%d", target, entry.Port)
+					}
+
+					id := entry.ResolvedIdentity(cfg.KeysDir)
+					if id != "" {
+						id = DisplayPath(id)
+					} else {
+						id = "-"
+					}
+
+					desc := entry.Description
+					if desc == "" {
+						desc = "-"
+					}
+
+					fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", name, target, id, desc)
+				}
+			}
+			return w.Flush()
+		},
+	}
+
+	cmd.Flags().BoolVarP(&raw, "raw", "q", false, "Output only alias names")
+	cmd.Flags().BoolVarP(&showCmds, "commands", "c", false, "Display full SSH command for each alias")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "Output aliases as JSON")
+	return cmd
+}
+
+func newShowCommand() *cobra.Command {
 	return &cobra.Command{
-		Use:   "list",
-		Short: "List configured SSH servers",
+		Use:     "show <alias>",
+		Aliases: []string{"get"},
+		Short:   "Show details for an SSH alias",
+		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig(resolveConfigPath())
 			if err != nil {
 				return err
 			}
-			if len(cfg.Entries) == 0 {
-				fmt.Println("No configured servers")
-				return nil
+
+			entry, ok := cfg.Entries[args[0]]
+			if !ok {
+				return fmt.Errorf("unknown SSH alias: %q", args[0])
 			}
-			fmt.Println("Configured servers:")
-			for name := range cfg.Entries {
-				fmt.Printf("  - %s\n", name)
+
+			target := entry.Host
+			if entry.User != "" {
+				target = entry.User + "@" + entry.Host
 			}
+			if entry.Port > 0 {
+				target = fmt.Sprintf("%s:%d", target, entry.Port)
+			}
+
+			fmt.Printf("Alias:       %s\n", args[0])
+			fmt.Printf("Target:      %s\n", target)
+			fmt.Printf("Host:        %s\n", entry.Host)
+			if entry.User != "" {
+				fmt.Printf("User:        %s\n", entry.User)
+			}
+			if entry.Port > 0 {
+				fmt.Printf("Port:        %d\n", entry.Port)
+			}
+			if id := entry.ResolvedIdentity(cfg.KeysDir); id != "" {
+				fmt.Printf("Identity:    %s\n", DisplayPath(id))
+			}
+			if entry.ProxyJump != "" {
+				fmt.Printf("ProxyJump:   %s\n", entry.ProxyJump)
+			}
+			if entry.Description != "" {
+				fmt.Printf("Description: %s\n", entry.Description)
+			}
+			if len(entry.ExtraArgs) > 0 {
+				fmt.Printf("Extra Args:  %s\n", strings.Join(entry.ExtraArgs, " "))
+			}
+			fmt.Printf("SSH Command: %s\n", BuildSSHCommandString(args[0], entry, cfg.KeysDir))
+
 			return nil
 		},
 	}
 }
 
-func newConnectCommand() *cobra.Command {
+func newCommandCommand() *cobra.Command {
 	return &cobra.Command{
-		Use:   "connect <name>",
-		Short: "Connect to a configured SSH server",
-		Args:  cobra.ExactArgs(1),
+		Use:     "cmd <alias>",
+		Aliases: []string{"command"},
+		Short:   "Print the raw SSH command for an alias",
+		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig(resolveConfigPath())
 			if err != nil {
-				return fmt.Errorf("config error: %w", err)
+				return err
 			}
-
 			entry, ok := cfg.Entries[args[0]]
 			if !ok {
-				return fmt.Errorf("unknown server: %s", args[0])
+				return fmt.Errorf("unknown SSH alias: %q", args[0])
 			}
-
-			clientConfig, err := buildSSHClientConfig(entry, cfg.KeysDir)
-			if err != nil {
-				return fmt.Errorf("ssh config error: %w", err)
-			}
-
-			return connectWithNativeSSH(entry, clientConfig)
+			fmt.Println(BuildSSHCommandString(args[0], entry, cfg.KeysDir))
+			return nil
 		},
 	}
 }
 
 func newAddCommand() *cobra.Command {
-	var user, host, alias, password string
+	var user, host, password, identity, proxyJump, description string
 	var port int
 	var extraArgs []string
+	var noSync bool
 
 	cmd := &cobra.Command{
-		Use:   "add <name> [user@host]",
-		Short: "Add a new SSH connection entry",
+		Use:   "add <alias> [user@host[:port]]",
+		Short: "Add or update an SSH alias",
 		Args:  cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			alias = args[0]
+			alias := args[0]
+			if builtinCommands[alias] {
+				return fmt.Errorf("cannot use reserved command name %q as an alias", alias)
+			}
+
 			if len(args) == 2 {
-				parsedUser, parsedHost, found := strings.Cut(args[1], "@")
-				if !found || parsedUser == "" || parsedHost == "" {
-					return fmt.Errorf("target must be in the form user@host")
+				raw := args[1]
+				// Parse user@host:port or host:port or user@host
+				if atIdx := strings.Index(raw, "@"); atIdx != -1 {
+					if user == "" {
+						user = raw[:atIdx]
+					}
+					raw = raw[atIdx+1:]
 				}
-				if user == "" {
-					user = parsedUser
+				if colonIdx := strings.LastIndex(raw, ":"); colonIdx != -1 {
+					if p, err := strconv.Atoi(raw[colonIdx+1:]); err == nil && port == 0 {
+						port = p
+					}
+					raw = raw[:colonIdx]
 				}
 				if host == "" {
-					host = parsedHost
+					host = raw
 				}
 			}
-			if user == "" {
-				return fmt.Errorf("user is required")
-			}
+
 			if host == "" {
-				return fmt.Errorf("host is required")
+				return fmt.Errorf("host is required (pass user@host or use --host)")
 			}
 			if port == 0 {
 				port = 22
@@ -124,24 +315,54 @@ func newAddCommand() *cobra.Command {
 				if !os.IsNotExist(err) {
 					return fmt.Errorf("load config: %w", err)
 				}
-				cfg = config{Entries: map[string]entry{}}
+				cfg = Config{Entries: map[string]Entry{}}
 			}
 			if cfg.Entries == nil {
-				cfg.Entries = map[string]entry{}
+				cfg.Entries = map[string]Entry{}
 			}
 
-			cfg.Entries[alias] = entry{
-				User:      user,
-				Host:      host,
-				Port:      port,
-				Password:  password,
-				ExtraArgs: extraArgs,
+			// Preserve existing properties if updating
+			existing, exists := cfg.Entries[alias]
+			if exists {
+				if user == "" {
+					user = existing.User
+				}
+				if identity == "" && existing.Identity != "" {
+					identity = existing.Identity
+				}
+				if proxyJump == "" && existing.ProxyJump != "" {
+					proxyJump = existing.ProxyJump
+				}
+				if description == "" && existing.Description != "" {
+					description = existing.Description
+				}
+				if password == "" && existing.Password != "" {
+					password = existing.Password
+				}
+			}
+
+			cfg.Entries[alias] = Entry{
+				User:        user,
+				Host:        host,
+				Port:        port,
+				Password:    password,
+				Identity:    identity,
+				ProxyJump:   proxyJump,
+				Description: description,
+				ExtraArgs:   extraArgs,
 			}
 
 			if err := saveConfig(configPath, cfg); err != nil {
 				return err
 			}
-			fmt.Printf("Added connection %q\n", alias)
+			fmt.Printf("✓ Added SSH alias %q -> %s\n", alias, BuildSSHCommandString(alias, cfg.Entries[alias], cfg.KeysDir))
+
+			if !noSync {
+				if err := SyncAliasesFile(cfg, "", "function", detectShell()); err == nil {
+					fmt.Printf("✓ Synced aliases to %s\n", DisplayPath(ResolveAliasesFilePath()))
+				}
+			}
+
 			return nil
 		},
 	}
@@ -149,45 +370,297 @@ func newAddCommand() *cobra.Command {
 	cmd.Flags().StringVarP(&user, "user", "u", "", "SSH username")
 	cmd.Flags().StringVarP(&host, "host", "H", "", "SSH host")
 	cmd.Flags().IntVarP(&port, "port", "p", 0, "SSH port")
+	cmd.Flags().StringVarP(&identity, "identity", "i", "", "SSH identity/private key file")
+	cmd.Flags().StringVarP(&proxyJump, "proxy-jump", "J", "", "SSH proxy jump target")
+	cmd.Flags().StringVarP(&description, "description", "d", "", "Description for this alias")
 	cmd.Flags().StringVarP(&password, "password", "P", "", "SSH password")
 	cmd.Flags().StringSliceVar(&extraArgs, "extra-arg", nil, "Additional SSH arguments")
+	cmd.Flags().BoolVar(&noSync, "no-sync", false, "Skip auto-syncing ~/.kgssh/aliases.sh")
 	return cmd
 }
 
 func newRemoveCommand() *cobra.Command {
-	return &cobra.Command{
-		Use:   "remove <name>",
-		Short: "Remove a configured SSH server",
-		Args:  cobra.ExactArgs(1),
+	var noSync bool
+
+	cmd := &cobra.Command{
+		Use:     "remove <alias>",
+		Aliases: []string{"rm"},
+		Short:   "Remove a configured SSH alias",
+		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			configPath := resolveConfigPath()
 			cfg, err := loadConfig(configPath)
 			if err != nil {
 				if os.IsNotExist(err) {
-					return fmt.Errorf("no configured servers")
+					return fmt.Errorf("no configured aliases")
 				}
 				return fmt.Errorf("load config: %w", err)
 			}
 
-			if _, ok := cfg.Entries[args[0]]; !ok {
-				return fmt.Errorf("unknown server: %s", args[0])
+			alias := args[0]
+			if _, ok := cfg.Entries[alias]; !ok {
+				return fmt.Errorf("unknown SSH alias: %q", alias)
 			}
 
-			delete(cfg.Entries, args[0])
+			delete(cfg.Entries, alias)
 			if err := saveConfig(configPath, cfg); err != nil {
 				return err
 			}
 
-			fmt.Printf("Removed connection %q\n", args[0])
+			fmt.Printf("✓ Removed SSH alias %q\n", alias)
+			if !noSync {
+				if err := SyncAliasesFile(cfg, "", "function", detectShell()); err == nil {
+					fmt.Printf("✓ Synced aliases to %s\n", DisplayPath(ResolveAliasesFilePath()))
+				}
+			}
 			return nil
 		},
 	}
+
+	cmd.Flags().BoolVar(&noSync, "no-sync", false, "Skip auto-syncing ~/.kgssh/aliases.sh")
+	return cmd
+}
+
+func newRunCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:                "run <alias> [args...]",
+		Aliases:            []string{"exec"},
+		Short:              "Connect to an SSH alias or execute a remote command",
+		Args:               cobra.MinimumNArgs(1),
+		DisableFlagParsing: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig(resolveConfigPath())
+			if err != nil {
+				return fmt.Errorf("config error: %w", err)
+			}
+
+			aliasName := args[0]
+			entry, ok := cfg.Entries[aliasName]
+			if !ok {
+				return fmt.Errorf("unknown SSH alias: %q\nRun 'kgssh list' to view aliases", aliasName)
+			}
+
+			return RunSSH(entry, cfg.KeysDir, args[1:])
+		},
+	}
+}
+
+func newConnectCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:                "connect <alias> [args...]",
+		Short:              "Connect to an SSH alias (synonym for 'run')",
+		Args:               cobra.MinimumNArgs(1),
+		DisableFlagParsing: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig(resolveConfigPath())
+			if err != nil {
+				return fmt.Errorf("config error: %w", err)
+			}
+
+			aliasName := args[0]
+			entry, ok := cfg.Entries[aliasName]
+			if !ok {
+				return fmt.Errorf("unknown SSH alias: %q", aliasName)
+			}
+
+			return RunSSH(entry, cfg.KeysDir, args[1:])
+		},
+	}
+}
+
+func newExportCommand() *cobra.Command {
+	var format, shellType string
+
+	cmd := &cobra.Command{
+		Use:     "export",
+		Aliases: []string{"env"},
+		Short:   "Export SSH aliases as shell functions or aliases",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig(resolveConfigPath())
+			if err != nil {
+				if os.IsNotExist(err) {
+					return nil
+				}
+				return err
+			}
+			if shellType == "" {
+				shellType = detectShell()
+			}
+			fmt.Print(GenerateAll(cfg, format, shellType))
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&format, "format", "function", "Format to export: 'function' (supports extra args) or 'alias'")
+	cmd.Flags().StringVar(&shellType, "shell", "", "Shell type: 'zsh', 'bash', or 'fish' (auto-detected by default)")
+	return cmd
+}
+
+func newInitCommand() *cobra.Command {
+	var format, shellType string
+
+	cmd := &cobra.Command{
+		Use:   "init [shell]",
+		Short: "Output shell initialization hook for eval \"$(kgssh init)\"",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig(resolveConfigPath())
+			if err != nil {
+				if os.IsNotExist(err) {
+					return nil
+				}
+				return err
+			}
+			if len(args) > 0 {
+				shellType = args[0]
+			}
+			if shellType == "" {
+				shellType = detectShell()
+			}
+			fmt.Print(GenerateAll(cfg, format, shellType))
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&format, "format", "function", "Format: 'function' (recommended) or 'alias'")
+	cmd.Flags().StringVar(&shellType, "shell", "", "Shell: 'zsh', 'bash', or 'fish'")
+	return cmd
+}
+
+func newSyncCommand() *cobra.Command {
+	var install bool
+	var outFile, format, shellType string
+
+	cmd := &cobra.Command{
+		Use:   "sync",
+		Short: "Sync SSH aliases to ~/.kgssh/aliases.sh",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig(resolveConfigPath())
+			if err != nil {
+				if os.IsNotExist(err) {
+					return fmt.Errorf("no config found at %s", resolveConfigPath())
+				}
+				return err
+			}
+
+			if shellType == "" {
+				shellType = detectShell()
+			}
+
+			targetFile := outFile
+			if targetFile == "" {
+				targetFile = ResolveAliasesFilePath()
+			}
+
+			if err := SyncAliasesFile(cfg, targetFile, format, shellType); err != nil {
+				return fmt.Errorf("sync aliases: %w", err)
+			}
+			fmt.Printf("✓ Successfully synced %d SSH aliases to %s\n", len(cfg.Entries), DisplayPath(targetFile))
+
+			if install {
+				installed, err := InstallShellHook("", targetFile)
+				if err != nil {
+					return fmt.Errorf("install shell hook: %w", err)
+				}
+				if installed {
+					fmt.Println("✓ Added source hook to your shell RC file! Run 'source ~/.zshrc' (or open a new terminal) to use aliases.")
+				} else {
+					fmt.Println("✓ Shell RC file is already configured to source aliases.")
+				}
+			} else {
+				fmt.Printf("Tip: Run 'kgssh sync --install' to auto-add source hook to your shell RC file,\n     or add: [ -f %s ] && source %s\n", DisplayPath(targetFile), DisplayPath(targetFile))
+			}
+
+			return nil
+		},
+	}
+
+	cmd.Flags().BoolVar(&install, "install", false, "Automatically configure ~/.zshrc or ~/.bashrc to source aliases")
+	cmd.Flags().StringVar(&outFile, "file", "", "Target file to write aliases to (default ~/.kgssh/aliases.sh)")
+	cmd.Flags().StringVar(&format, "format", "function", "Format: 'function' or 'alias'")
+	cmd.Flags().StringVar(&shellType, "shell", "", "Shell: 'zsh', 'bash', or 'fish'")
+	return cmd
+}
+
+func newImportSSHConfigCommand() *cobra.Command {
+	var overwrite, dryRun, noSync bool
+
+	cmd := &cobra.Command{
+		Use:   "import-ssh-config [path]",
+		Short: "Import SSH aliases from OpenSSH ~/.ssh/config",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			configPath := ""
+			if len(args) > 0 {
+				configPath = args[0]
+			}
+
+			imported, err := ImportSSHConfigFile(configPath)
+			if err != nil {
+				return fmt.Errorf("import ssh config: %w", err)
+			}
+
+			if len(imported) == 0 {
+				fmt.Println("No valid Host entries found in SSH config.")
+				return nil
+			}
+
+			cfgPath := resolveConfigPath()
+			cfg, _ := loadConfig(cfgPath)
+			if cfg.Entries == nil {
+				cfg.Entries = map[string]Entry{}
+			}
+
+			count := 0
+			for name, entry := range imported {
+				if builtinCommands[name] {
+					continue
+				}
+				if _, exists := cfg.Entries[name]; exists && !overwrite {
+					fmt.Printf("Skipping existing alias %q (use --overwrite to replace)\n", name)
+					continue
+				}
+				if dryRun {
+					fmt.Printf("[dry-run] Would import %s -> %s\n", name, BuildSSHCommandString(name, entry, cfg.KeysDir))
+				} else {
+					cfg.Entries[name] = entry
+					fmt.Printf("✓ Imported alias %q -> %s\n", name, BuildSSHCommandString(name, entry, cfg.KeysDir))
+				}
+				count++
+			}
+
+			if dryRun {
+				fmt.Printf("\n[dry-run] Total %d aliases would be imported.\n", count)
+				return nil
+			}
+
+			if count > 0 {
+				if err := saveConfig(cfgPath, cfg); err != nil {
+					return err
+				}
+				fmt.Printf("✓ Saved %d imported aliases to %s\n", count, DisplayPath(cfgPath))
+
+				if !noSync {
+					_ = SyncAliasesFile(cfg, "", "function", detectShell())
+				}
+			} else {
+				fmt.Println("No new aliases imported.")
+			}
+
+			return nil
+		},
+	}
+
+	cmd.Flags().BoolVar(&overwrite, "overwrite", false, "Overwrite existing aliases with same name")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Preview imports without modifying configuration")
+	cmd.Flags().BoolVar(&noSync, "no-sync", false, "Skip auto-syncing ~/.kgssh/aliases.sh")
+	return cmd
 }
 
 func newSetKeysDirCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "set-keys-dir <dir>",
-		Short: "Set the SSH keys directory for bare identity filenames",
+		Short: "Set the SSH keys directory for identity fallback resolution",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			configPath := resolveConfigPath()
@@ -196,16 +669,14 @@ func newSetKeysDirCommand() *cobra.Command {
 				if !os.IsNotExist(err) {
 					return fmt.Errorf("load config: %w", err)
 				}
-				cfg = config{Entries: map[string]entry{}}
-			}
-			if cfg.Entries == nil {
-				cfg.Entries = map[string]entry{}
+				cfg = Config{Entries: map[string]Entry{}}
 			}
 			cfg.KeysDir = args[0]
 			if err := saveConfig(configPath, cfg); err != nil {
 				return err
 			}
-			fmt.Printf("SSH keys directory set to %q\n", args[0])
+			fmt.Printf("✓ SSH keys directory set to %q\n", args[0])
+			_ = SyncAliasesFile(cfg, "", "function", detectShell())
 			return nil
 		},
 	}
@@ -214,7 +685,7 @@ func newSetKeysDirCommand() *cobra.Command {
 func newShowConfigCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "show-config",
-		Short: "Show the current kgssh configuration",
+		Short: "Show raw kgssh JSON configuration",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig(resolveConfigPath())
 			if err != nil {
@@ -230,271 +701,16 @@ func newShowConfigCommand() *cobra.Command {
 	}
 }
 
-func resolveConfigPath() string {
-	if path := os.Getenv("KGSSH_CONFIG"); path != "" {
-		return path
+func detectShell() string {
+	shell := os.Getenv("SHELL")
+	if strings.Contains(shell, "zsh") {
+		return "zsh"
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		home = os.Getenv("HOME")
+	if strings.Contains(shell, "bash") {
+		return "bash"
 	}
-	return filepath.Join(home, ".kgssh", "config.json")
-}
-
-type config struct {
-	Entries map[string]entry `json:"entries"`
-	KeysDir string           `json:"keysDir,omitempty"`
-}
-
-type entry struct {
-	User      string   `json:"user"`
-	Host      string   `json:"host"`
-	Port      int      `json:"port,omitempty"`
-	Password  string   `json:"password,omitempty"`
-	ExtraArgs []string `json:"extraArgs,omitempty"`
-}
-
-func loadConfig(path string) (config, error) {
-	var cfg config
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return cfg, err
+	if strings.Contains(shell, "fish") {
+		return "fish"
 	}
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return cfg, err
-	}
-	if cfg.Entries == nil {
-		cfg.Entries = map[string]entry{}
-	}
-	return cfg, nil
-}
-
-func saveConfig(path string, cfg config) error {
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return fmt.Errorf("encode config: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("create config directory: %w", err)
-	}
-	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
-		return fmt.Errorf("write config: %w", err)
-	}
-	return nil
-}
-
-func connectWithNativeSSH(entry entry, clientConfig *ssh.ClientConfig) error {
-	address := entry.Host
-	if entry.Port > 0 {
-		address = net.JoinHostPort(entry.Host, strconv.Itoa(entry.Port))
-	}
-
-	fmt.Fprintf(os.Stderr, "Connecting to %s...\n", address)
-
-	conn, err := ssh.Dial("tcp", address, clientConfig)
-	if err != nil {
-		return fmt.Errorf("dial SSH: %w", err)
-	}
-	defer conn.Close()
-
-	session, err := conn.NewSession()
-	if err != nil {
-		return fmt.Errorf("create SSH session: %w", err)
-	}
-	defer session.Close()
-
-	session.Stdin = os.Stdin
-	session.Stdout = os.Stdout
-	session.Stderr = os.Stderr
-
-	if err := session.RequestPty("xterm", 40, 80, ssh.TerminalModes{ssh.ECHO: 1}); err != nil {
-		return fmt.Errorf("request PTY: %w", err)
-	}
-
-	if err := session.Shell(); err != nil {
-		return fmt.Errorf("start shell: %w", err)
-	}
-
-	if err := session.Wait(); err != nil {
-		if exitErr, ok := err.(*ssh.ExitError); ok {
-			os.Exit(exitErr.ExitStatus())
-		}
-		return fmt.Errorf("SSH session failed: %w", err)
-	}
-	return nil
-}
-
-func buildSSHClientConfig(entry entry, keysDir string) (*ssh.ClientConfig, error) {
-	clientConfig := &ssh.ClientConfig{
-		User:            entry.User,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-	}
-
-	var authMethods []ssh.AuthMethod
-	if entry.Password != "" {
-		authMethods = append(authMethods, ssh.Password(entry.Password))
-	}
-
-	for i := 0; i < len(entry.ExtraArgs); i++ {
-		if entry.ExtraArgs[i] != "-i" && entry.ExtraArgs[i] != "--identity-file" {
-			continue
-		}
-		if i+1 >= len(entry.ExtraArgs) {
-			return nil, fmt.Errorf("missing path for identity file")
-		}
-		signer, err := loadSSHPrivateKey(entry.ExtraArgs[i+1], keysDir)
-		if err != nil {
-			return nil, fmt.Errorf("load identity %q: %w", entry.ExtraArgs[i+1], err)
-		}
-		authMethods = append(authMethods, ssh.PublicKeys(signer))
-		i++
-	}
-
-	if agentAuthMethod, err := sshAgentAuthMethod(); err == nil {
-		authMethods = append(authMethods, agentAuthMethod)
-	}
-
-	authMethods = append(authMethods, loadDefaultSSHAuthMethods(keysDir)...)
-
-	clientConfig.Auth = authMethods
-	return clientConfig, nil
-}
-
-func loadDefaultSSHAuthMethods(keysDir string) []ssh.AuthMethod {
-	var authMethods []ssh.AuthMethod
-	seen := map[string]struct{}{}
-
-	for _, dir := range defaultSSHKeyDirs(keysDir) {
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			continue
-		}
-		for _, entry := range entries {
-			if entry.IsDir() {
-				continue
-			}
-			if !isLikelySSHPrivateKeyFile(entry.Name()) {
-				continue
-			}
-			if _, ok := seen[entry.Name()]; ok {
-				continue
-			}
-			signer, err := loadSSHPrivateKey(entry.Name(), keysDir)
-			if err != nil {
-				continue
-			}
-			authMethods = append(authMethods, ssh.PublicKeys(signer))
-			seen[entry.Name()] = struct{}{}
-		}
-	}
-
-	return authMethods
-}
-
-func defaultSSHKeyDirs(keysDir string) []string {
-	if keysDir != "" {
-		expanded := expandPath(keysDir)
-		if expanded != "" {
-			return []string{expanded}
-		}
-		return nil
-	}
-	if home := userHomeDir(); home != "" {
-		return []string{filepath.Join(home, ".ssh")}
-	}
-	return nil
-}
-
-func isLikelySSHPrivateKeyFile(name string) bool {
-	if name == "" {
-		return false
-	}
-	if strings.HasSuffix(name, ".pub") {
-		return false
-	}
-	if strings.HasPrefix(name, ".") {
-		return false
-	}
-	return true
-}
-
-func sshAgentAuthMethod() (ssh.AuthMethod, error) {
-	socketPath := os.Getenv("SSH_AUTH_SOCK")
-	if socketPath == "" {
-		return nil, fmt.Errorf("SSH_AUTH_SOCK is not set")
-	}
-
-	conn, err := net.Dial("unix", socketPath)
-	if err != nil {
-		return nil, err
-	}
-
-	agentClient := agent.NewClient(conn)
-	signers, err := agentClient.Signers()
-	if err != nil {
-		conn.Close()
-		return nil, err
-	}
-	if len(signers) == 0 {
-		conn.Close()
-		return nil, fmt.Errorf("SSH agent has no identities")
-	}
-
-	return ssh.PublicKeysCallback(agentClient.Signers), nil
-}
-
-func loadSSHPrivateKey(path, keysDir string) (ssh.Signer, error) {
-	expanded := expandPath(path)
-	data, err := os.ReadFile(expanded)
-	if err == nil {
-		return ssh.ParsePrivateKey(data)
-	}
-
-	if fallback := sshFallbackPath(expanded, keysDir); fallback != "" {
-		data, err2 := os.ReadFile(fallback)
-		if err2 == nil {
-			return ssh.ParsePrivateKey(data)
-		}
-	}
-
-	return nil, err
-}
-
-func sshFallbackPath(path, keysDir string) string {
-	if filepath.IsAbs(path) {
-		return ""
-	}
-	if strings.Contains(path, string(os.PathSeparator)) {
-		return ""
-	}
-	if keysDir == "" {
-		if home := userHomeDir(); home != "" {
-			return filepath.Join(home, ".ssh", path)
-		}
-		return ""
-	}
-	return filepath.Join(expandPath(keysDir), path)
-}
-
-func expandPath(path string) string {
-	if path == "~" {
-		if home := userHomeDir(); home != "" {
-			return home
-		}
-		return path
-	}
-	if strings.HasPrefix(path, "~/") {
-		if home := userHomeDir(); home != "" {
-			return filepath.Join(home, path[2:])
-		}
-	}
-	return path
-}
-
-func userHomeDir() string {
-	home, err := os.UserHomeDir()
-	if err == nil && home != "" {
-		return home
-	}
-	return os.Getenv("HOME")
+	return "zsh"
 }
