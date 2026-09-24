@@ -67,6 +67,14 @@ func buildSSHClientConfig(entry entry, keysDir string) (*ssh.ClientConfig, error
 		authMethods = append(authMethods, ssh.Password(entry.Password))
 	}
 
+	if entry.Identity != "" {
+		signer, err := loadSSHPrivateKey(entry.Identity, keysDir)
+		if err != nil {
+			return nil, fmt.Errorf("load identity %q: %w", entry.Identity, err)
+		}
+		authMethods = append(authMethods, ssh.PublicKeys(signer))
+	}
+
 	for i := 0; i < len(entry.ExtraArgs); i++ {
 		if entry.ExtraArgs[i] != "-i" && entry.ExtraArgs[i] != "--identity-file" {
 			continue
@@ -95,6 +103,22 @@ func buildSSHClientConfig(entry entry, keysDir string) (*ssh.ClientConfig, error
 func loadDefaultSSHAuthMethods(keysDir string) []ssh.AuthMethod {
 	var authMethods []ssh.AuthMethod
 	seen := map[string]struct{}{}
+
+	knownKeyNames := []string{
+		"dev_chat360",
+		"id_rsa_chat360",
+		"id_ed25519",
+		"id_rsa",
+		"id_ecdsa",
+		"google_compute_engine",
+	}
+	for _, name := range knownKeyNames {
+		signer, err := loadSSHPrivateKey(name, keysDir)
+		if err == nil {
+			authMethods = append(authMethods, ssh.PublicKeys(signer))
+			seen[name] = struct{}{}
+		}
+	}
 
 	for _, dir := range defaultSSHKeyDirs(keysDir) {
 		entries, err := os.ReadDir(dir)
@@ -176,16 +200,23 @@ func sshAgentAuthMethod() (ssh.AuthMethod, error) {
 }
 
 func loadSSHPrivateKey(path, keysDir string) (ssh.Signer, error) {
-	expanded := expandPath(path)
-	data, err := os.ReadFile(expanded)
+	resolved := resolveKeyPath(path, keysDir)
+	data, err := os.ReadFile(resolved)
 	if err == nil {
 		return ssh.ParsePrivateKey(data)
 	}
 
+	expanded := expandPath(path)
+	if expanded != resolved {
+		if data2, err2 := os.ReadFile(expanded); err2 == nil {
+			return ssh.ParsePrivateKey(data2)
+		}
+	}
+
 	if fallback := sshFallbackPath(expanded, keysDir); fallback != "" {
-		data, err2 := os.ReadFile(fallback)
-		if err2 == nil {
-			return ssh.ParsePrivateKey(data)
+		data3, err3 := os.ReadFile(fallback)
+		if err3 == nil {
+			return ssh.ParsePrivateKey(data3)
 		}
 	}
 

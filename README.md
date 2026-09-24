@@ -1,17 +1,26 @@
 # kgssh
 
-**kgssh** is a hybrid SSH Alias Manager for macOS and Linux. It lets you define named SSH connections, exports them as native shell functions/aliases (with argument and command forwarding), syncs them to your active shell (`zsh`, `bash`, `fish`), and provides a direct runner CLI.
+**kgssh** is a unified SSH Alias Manager & Model Context Protocol (MCP) Server for macOS and Linux. It lets you define named SSH connections, exports them as native shell functions/aliases (with argument and command forwarding), syncs them to your active shell (`zsh`, `bash`, `fish`), provides a direct runner CLI, and serves high-performance remote execution, SFTP, and server management tools to AI assistants via MCP.
 
 ---
 
 ## Features
 
+- **Model Context Protocol (MCP) Server**: Run `kgssh mcp` to serve native MCP tools over stdio for AI coding assistants (Antigravity, Cursor, Claude Desktop, etc.).
+  - `list_servers`: List configured servers and auth methods.
+  - `ssh_exec`: Execute shell commands on remote servers with timeout, PTY, and connection pooling.
+  - `test_connection`: Test connectivity and latency to servers.
+  - `read_file` / `write_file` / `list_directory`: Secure SFTP file reading, writing, and directory listing.
+  - `add_server` / `remove_server`: Add/remove servers with instant auto-sync to shell aliases.
+  - `get_server_info` / `update_server_info`: Store and inspect operational playbooks, key services, health checks, and log paths.
 - **Native Shell Functions & Aliases**: Generates functions like `prod1() { ssh ... "$@"; }` allowing direct terminal usage (`prod1`, `prod1 "ls -la"`, `prod1 -L 8080:localhost:8080`).
 - **Hybrid CLI & Shell**:
   - Run directly via shell: `prod1`
   - Run via CLI: `kgssh prod1` or `kgssh run prod1`
+  - Test latency via CLI: `kgssh test prod1` or `kgssh test`
+  - View operational docs via CLI: `kgssh info prod1` or `kgssh info`
   - Inspect resolved command: `kgssh cmd prod1`
-- **Automatic Syncing**: Any `kgssh add` or `kgssh remove` automatically refreshes `~/.kgssh/aliases.sh`.
+- **Automatic Syncing**: Any `kgssh add`, `kgssh remove`, or MCP mutation automatically refreshes `~/.kgssh/aliases.sh`.
 - **Cross-Platform Identity Resolution**: Automatically detects and heals key paths across environments (e.g. Linux `/home/...` to macOS `~/.ssh/...`).
 - **OpenSSH Import**: Easily import existing `Host` blocks from `~/.ssh/config` using `kgssh import-ssh-config`.
 - **Full OpenSSH Compatibility**: Leverages your system `ssh` binary directly, ensuring full support for agent forwarding, tmux, vim, escape sequences, and native PTY.
@@ -122,6 +131,45 @@ kgssh import-ssh-config
 
 # Overwrite existing aliases if duplicate names match
 kgssh import-ssh-config --overwrite
+### 8. Test Connectivity & Latency
+```bash
+# Test all configured servers
+kgssh test
+
+# Test a specific server
+kgssh test prod1 -t 10
+```
+
+### 9. View Operational Context & Playbooks
+```bash
+# Overview of all servers
+kgssh info
+
+# Detailed architecture, services, logs, and health check instructions for a server
+kgssh info agentic-stage
+```
+
+### 10. Run as Model Context Protocol (MCP) Server
+```bash
+# Start MCP server over stdio
+kgssh mcp
+```
+
+#### MCP Integration Config
+Add to your MCP configuration (e.g. `~/.gemini/config/mcp_config.json` or Claude Desktop):
+
+```json
+{
+  "mcpServers": {
+    "ssh": {
+      "command": "/usr/local/bin/kgssh",
+      "args": ["mcp"],
+      "env": {
+        "KGSSH_CONFIG": "~/.kgssh/config.json"
+      }
+    }
+  }
+}
 ```
 
 ---

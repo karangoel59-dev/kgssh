@@ -11,14 +11,26 @@ permissions:
 
 jobs:
   build:
-    name: Build (${{ matrix.os }})
+    name: Build (${{ matrix.asset_name }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
           - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
             asset_name: kgssh-linux-amd64
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            asset_name: kgssh-linux-arm64
           - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            asset_name: kgssh-darwin-arm64
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
             asset_name: kgssh-darwin-amd64
 
     steps:
@@ -28,12 +40,12 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: 'stable'
 
       - name: Build binary
         run: |
           mkdir -p dist
-          GOOS=$(go env GOOS) GOARCH=amd64 go build -o dist/${{ matrix.asset_name }} .
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -o dist/${{ matrix.asset_name }} .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -59,4 +71,6 @@ jobs:
           draft: false
           files: |
             dist/kgssh-linux-amd64/kgssh-linux-amd64
+            dist/kgssh-linux-arm64/kgssh-linux-arm64
             dist/kgssh-darwin-amd64/kgssh-darwin-amd64
+            dist/kgssh-darwin-arm64/kgssh-darwin-arm64

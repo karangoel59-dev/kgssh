@@ -55,6 +55,9 @@ func BuildSSHArgs(e Entry, keysDir string, portable bool) []string {
 func BuildSSHCommandString(name string, e Entry, keysDir string) string {
 	args := BuildSSHArgs(e, keysDir, true)
 	var parts []string
+	if e.Password != "" {
+		parts = append(parts, "sshpass", "-p", fmt.Sprintf("%q", e.Password))
+	}
 	parts = append(parts, "ssh")
 	for _, a := range args {
 		if strings.ContainsAny(a, " \t\n\"'$") {

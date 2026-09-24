@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
+	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/spf13/cobra"
 )
 
@@ -32,6 +34,11 @@ var builtinCommands = map[string]bool{
 	"import-ssh-config": true,
 	"set-keys-dir":      true,
 	"show-config":       true,
+	"mcp":               true,
+	"serve":             true,
+	"mcp-server":        true,
+	"test":              true,
+	"info":              true,
 	"help":              true,
 	"completion":        true,
 }
@@ -48,10 +55,11 @@ func newRootCommand() *cobra.Command {
 
 	root := &cobra.Command{
 		Use:   "kgssh [command|alias] [args...]",
-		Short: "SSH alias manager — configure, generate, and run SSH aliases",
-		Long: `kgssh is an SSH alias manager.
+		Short: "SSH alias manager and MCP server — configure, generate, run, and automate SSH connections",
+		Long: `kgssh is an SSH alias manager and Model Context Protocol (MCP) server.
 It organizes named SSH targets, exports them as native shell functions/aliases
-for zsh and bash, syncs them to your environment, and provides a direct runner.`,
+for zsh and bash, syncs them to your environment, provides a direct runner,
+and serves high-performance remote execution and SFTP tools over MCP.`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 0 {
@@ -79,6 +87,9 @@ for zsh and bash, syncs them to your environment, and provides a direct runner.`
 	root.AddCommand(newImportSSHConfigCommand())
 	root.AddCommand(newSetKeysDirCommand())
 	root.AddCommand(newShowConfigCommand())
+	root.AddCommand(newMCPCommand())
+	root.AddCommand(newTestCommand())
+	root.AddCommand(newInfoCommand())
 
 	// Dynamically register aliases as runnable subcommands for shell completion & direct execution
 	for name, entry := range cfg.Entries {
@@ -714,3 +725,83 @@ func detectShell() string {
 	}
 	return "zsh"
 }
+
+func newMCPCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:     "mcp",
+		Aliases: []string{"serve", "mcp-server"},
+		Short:   "Start Model Context Protocol (MCP) server over stdio",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return RunMCPServer()
+		},
+	}
+}
+
+func newTestCommand() *cobra.Command {
+	var timeoutSec int
+
+	cmd := &cobra.Command{
+		Use:   "test [alias]",
+		Short: "Test SSH connectivity and measure latency to one or all aliases",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			target := "all"
+			if len(args) > 0 {
+				target = args[0]
+			}
+			res, err := handleTestConnection(context.Background(), mcp.CallToolRequest{
+				Params: mcp.CallToolParams{
+					Name: "test_connection",
+					Arguments: map[string]any{
+						"server":  target,
+						"timeout": timeoutSec,
+					},
+				},
+			})
+			if err != nil {
+				return err
+			}
+			for _, content := range res.Content {
+				if tc, ok := mcp.AsTextContent(content); ok {
+					fmt.Println(tc.Text)
+				}
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().IntVarP(&timeoutSec, "timeout", "t", 5, "Connection timeout in seconds")
+	return cmd
+}
+
+func newInfoCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "info [alias]",
+		Short: "Display operational context, architecture info, and checklists for aliases",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			target := "all"
+			if len(args) > 0 {
+				target = args[0]
+			}
+			res, err := handleGetServerInfo(context.Background(), mcp.CallToolRequest{
+				Params: mcp.CallToolParams{
+					Name: "get_server_info",
+					Arguments: map[string]any{
+						"server": target,
+					},
+				},
+			})
+			if err != nil {
+				return err
+			}
+			for _, content := range res.Content {
+				if tc, ok := mcp.AsTextContent(content); ok {
+					fmt.Println(tc.Text)
+				}
+			}
+			return nil
+		},
+	}
+}
+
