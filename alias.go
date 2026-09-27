@@ -51,20 +51,45 @@ func BuildSSHArgs(e Entry, keysDir string, portable bool) []string {
 	return args
 }
 
+// shellQuote quotes s for POSIX shells using single quotes, so $, backticks,
+// and backslashes are taken literally. A leading "~/" is kept outside the
+// quotes so the shell still expands it to $HOME.
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	if strings.HasPrefix(s, "~/") {
+		rest := s[2:]
+		if rest == "" {
+			return "~/"
+		}
+		return "~/" + shellQuote(rest)
+	}
+	safe := true
+	for _, r := range s {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("@%+=:,./_-", r)) {
+			safe = false
+			break
+		}
+	}
+	if safe {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 // BuildSSHCommandString constructs the complete runnable command line.
+// Passwords are passed via the SSHPASS environment variable (sshpass -e)
+// rather than -p, so they don't appear in the process list.
 func BuildSSHCommandString(name string, e Entry, keysDir string) string {
 	args := BuildSSHArgs(e, keysDir, true)
 	var parts []string
 	if e.Password != "" {
-		parts = append(parts, "sshpass", "-p", fmt.Sprintf("%q", e.Password))
+		parts = append(parts, "SSHPASS="+shellQuote(e.Password), "sshpass", "-e")
 	}
 	parts = append(parts, "ssh")
 	for _, a := range args {
-		if strings.ContainsAny(a, " \t\n\"'$") {
-			parts = append(parts, fmt.Sprintf("%q", a))
-		} else {
-			parts = append(parts, a)
-		}
+		parts = append(parts, shellQuote(a))
 	}
 	return strings.Join(parts, " ")
 }
@@ -75,19 +100,21 @@ func GenerateShellDefinition(name string, e Entry, keysDir string, format, shell
 	var sb strings.Builder
 
 	if e.Description != "" {
-		sb.WriteString(fmt.Sprintf("# %s: %s\n", name, e.Description))
+		// Keep the description on the comment line; a newline would turn the rest into live shell code.
+		desc := strings.Join(strings.Fields(e.Description), " ")
+		sb.WriteString(fmt.Sprintf("# %s: %s\n", name, desc))
 	}
 
 	switch shellType {
 	case "fish":
 		if format == "alias" {
-			sb.WriteString(fmt.Sprintf("alias %s %q\n", name, cmdStr))
+			sb.WriteString(fmt.Sprintf("alias %s %s\n", name, shellQuote(cmdStr)))
 		} else {
 			sb.WriteString(fmt.Sprintf("function %s\n    %s $argv\nend\n", name, cmdStr))
 		}
 	default: // zsh, bash, sh
 		if format == "alias" {
-			sb.WriteString(fmt.Sprintf("alias %s=%q\n", name, cmdStr))
+			sb.WriteString(fmt.Sprintf("alias %s=%s\n", name, shellQuote(cmdStr)))
 		} else {
 			// Functions allow passing arguments like `prod1 ls -la` or `prod1 -L 8080:localhost:8080`
 			sb.WriteString(fmt.Sprintf("%s() {\n    %s \"$@\"\n}\n", name, cmdStr))
@@ -136,7 +163,12 @@ func SyncAliasesFile(cfg Config, filePath, format, shellType string) error {
 		return fmt.Errorf("create dir for aliases: %w", err)
 	}
 	content := GenerateAll(cfg, format, shellType)
-	return os.WriteFile(filePath, []byte(content), 0o644)
+	// 0600: the file can contain passwords. WriteFile keeps an existing file's
+	// mode, so tighten it explicitly for files created by older versions.
+	if err := os.WriteFile(filePath, []byte(content), 0o600); err != nil {
+		return err
+	}
+	return os.Chmod(filePath, 0o600)
 }
 
 // InstallShellHook checks ~/.zshrc or ~/.bashrc and adds source line if not already present.

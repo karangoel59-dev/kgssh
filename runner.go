@@ -19,8 +19,10 @@ func RunSSH(e Entry, keysDir string, extraArgs []string) error {
 	var cmd *exec.Cmd
 	if e.Password != "" {
 		if sshpassPath, err := exec.LookPath("sshpass"); err == nil {
-			allArgs := append([]string{"-p", e.Password, sshPath}, sshArgs...)
+			// -e reads SSHPASS from the environment; -p would expose the password in ps.
+			allArgs := append([]string{"-e", sshPath}, sshArgs...)
 			cmd = exec.Command(sshpassPath, allArgs...)
+			cmd.Env = append(os.Environ(), "SSHPASS="+e.Password)
 		} else {
 			fmt.Fprintln(os.Stderr, "[kgssh] Note: password is configured, but 'sshpass' is not installed.")
 			fmt.Fprintln(os.Stderr, "[kgssh] Connecting with standard ssh (you may be prompted for password)...")
