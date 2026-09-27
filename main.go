@@ -14,6 +14,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// version is overridden at release build time via -ldflags "-X main.version=...".
+var version = "2.1.1"
+
 var builtinCommands = map[string]bool{
 	"add":               true,
 	"remove":            true,
@@ -54,8 +57,9 @@ func newRootCommand() *cobra.Command {
 	cfg, _ := loadConfig(resolveConfigPath())
 
 	root := &cobra.Command{
-		Use:   "kgssh [command|alias] [args...]",
-		Short: "SSH alias manager and MCP server — configure, generate, run, and automate SSH connections",
+		Use:     "kgssh [command|alias] [args...]",
+		Version: version,
+		Short:   "SSH alias manager and MCP server — configure, generate, run, and automate SSH connections",
 		Long: `kgssh is an SSH alias manager and Model Context Protocol (MCP) server.
 It organizes named SSH targets, exports them as native shell functions/aliases
 for zsh and bash, syncs them to your environment, provides a direct runner,
@@ -814,4 +818,3 @@ func newInfoCommand() *cobra.Command {
 		},
 	}
 }
-

@@ -45,7 +45,11 @@ jobs:
       - name: Build binary
         run: |
           mkdir -p dist
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -o dist/${{ matrix.asset_name }} .
+          LDFLAGS=""
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            LDFLAGS="-X main.version=${GITHUB_REF_NAME#v}"
+          fi
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -ldflags "$LDFLAGS" -o dist/${{ matrix.asset_name }} .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
