@@ -85,7 +85,7 @@ func argStringSlice(r mcp.CallToolRequest, key string) []string {
 func BuildMCPServer() *server.MCPServer {
 	s := server.NewMCPServer(
 		"kgssh",
-		"1.0.0",
+		version,
 		server.WithToolCapabilities(true),
 	)
 
