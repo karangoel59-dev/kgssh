@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -134,13 +135,17 @@ func dialEntry(entry Entry, keysDir string, timeout time.Duration) (*ssh.Client,
 	return ssh.NewClient(clientConn, chans, reqs), nil
 }
 
+// errSessionCreate marks failures that happened before the command was sent,
+// so callers know a retry cannot execute the command twice.
+var errSessionCreate = errors.New("create session")
+
 // RunRemoteCommand executes a shell command on an SSH client with timeout and optional PTY.
 func RunRemoteCommand(client *ssh.Client, cmd string, timeout time.Duration, pty bool) (*ExecResult, error) {
 	startTime := time.Now()
 
 	session, err := client.NewSession()
 	if err != nil {
-		return nil, fmt.Errorf("create session: %w", err)
+		return nil, fmt.Errorf("%w: %w", errSessionCreate, err)
 	}
 	defer session.Close()
 

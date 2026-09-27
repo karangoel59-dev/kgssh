@@ -67,12 +67,17 @@ func buildSSHClientConfig(entry entry, keysDir string) (*ssh.ClientConfig, error
 		authMethods = append(authMethods, ssh.Password(entry.Password))
 	}
 
+	// x/crypto/ssh tries each auth method name ("publickey") only once, so every
+	// key must go into a single PublicKeys method or later keys are never offered.
+	// Order: explicit identities, then agent keys, then default keys.
+	var signers []ssh.Signer
+
 	if entry.Identity != "" {
 		signer, err := loadSSHPrivateKey(entry.Identity, keysDir)
 		if err != nil {
 			return nil, fmt.Errorf("load identity %q: %w", entry.Identity, err)
 		}
-		authMethods = append(authMethods, ssh.PublicKeys(signer))
+		signers = append(signers, signer)
 	}
 
 	for i := 0; i < len(entry.ExtraArgs); i++ {
@@ -86,22 +91,42 @@ func buildSSHClientConfig(entry entry, keysDir string) (*ssh.ClientConfig, error
 		if err != nil {
 			return nil, fmt.Errorf("load identity %q: %w", entry.ExtraArgs[i+1], err)
 		}
-		authMethods = append(authMethods, ssh.PublicKeys(signer))
+		signers = append(signers, signer)
 		i++
 	}
 
-	if agentAuthMethod, err := sshAgentAuthMethod(); err == nil {
-		authMethods = append(authMethods, agentAuthMethod)
+	if agentSigners, err := sshAgentSigners(); err == nil {
+		signers = append(signers, agentSigners...)
 	}
 
-	authMethods = append(authMethods, loadDefaultSSHAuthMethods(keysDir)...)
+	signers = append(signers, loadDefaultSSHSigners(keysDir)...)
+
+	if signers = dedupeSigners(signers); len(signers) > 0 {
+		authMethods = append(authMethods, ssh.PublicKeys(signers...))
+	}
 
 	clientConfig.Auth = authMethods
 	return clientConfig, nil
 }
 
-func loadDefaultSSHAuthMethods(keysDir string) []ssh.AuthMethod {
-	var authMethods []ssh.AuthMethod
+// dedupeSigners drops repeated public keys so the same key isn't offered twice,
+// which would waste attempts against the server's MaxAuthTries.
+func dedupeSigners(signers []ssh.Signer) []ssh.Signer {
+	seen := map[string]struct{}{}
+	var result []ssh.Signer
+	for _, s := range signers {
+		key := string(s.PublicKey().Marshal())
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, s)
+	}
+	return result
+}
+
+func loadDefaultSSHSigners(keysDir string) []ssh.Signer {
+	var signers []ssh.Signer
 	seen := map[string]struct{}{}
 
 	knownKeyNames := []string{
@@ -115,7 +140,7 @@ func loadDefaultSSHAuthMethods(keysDir string) []ssh.AuthMethod {
 	for _, name := range knownKeyNames {
 		signer, err := loadSSHPrivateKey(name, keysDir)
 		if err == nil {
-			authMethods = append(authMethods, ssh.PublicKeys(signer))
+			signers = append(signers, signer)
 			seen[name] = struct{}{}
 		}
 	}
@@ -139,12 +164,12 @@ func loadDefaultSSHAuthMethods(keysDir string) []ssh.AuthMethod {
 			if err != nil {
 				continue
 			}
-			authMethods = append(authMethods, ssh.PublicKeys(signer))
+			signers = append(signers, signer)
 			seen[entry.Name()] = struct{}{}
 		}
 	}
 
-	return authMethods
+	return signers
 }
 
 func defaultSSHKeyDirs(keysDir string) []string {
@@ -174,7 +199,7 @@ func isLikelySSHPrivateKeyFile(name string) bool {
 	return true
 }
 
-func sshAgentAuthMethod() (ssh.AuthMethod, error) {
+func sshAgentSigners() ([]ssh.Signer, error) {
 	socketPath := os.Getenv("SSH_AUTH_SOCK")
 	if socketPath == "" {
 		return nil, fmt.Errorf("SSH_AUTH_SOCK is not set")
@@ -196,7 +221,8 @@ func sshAgentAuthMethod() (ssh.AuthMethod, error) {
 		return nil, fmt.Errorf("SSH agent has no identities")
 	}
 
-	return ssh.PublicKeysCallback(agentClient.Signers), nil
+	// The agent connection stays open: agent signers sign over it during the handshake.
+	return signers, nil
 }
 
 func loadSSHPrivateKey(path, keysDir string) (ssh.Signer, error) {

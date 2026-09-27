@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -285,8 +286,10 @@ func handleSSHExec(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallT
 		result, err = RunRemoteCommand(client, fullCmd, timeout, pty)
 	}
 
-	if err != nil {
-		// Stale connection or failed session, retry with fresh connection
+	if errors.Is(err, errSessionCreate) {
+		// Session never opened (stale pooled connection), so the command did not
+		// run; retry once on a fresh connection. Never retry after the command
+		// started (timeouts, transport errors) — it may still be running remotely.
 		globalPool.Close(server)
 		client, err2 := globalPool.GetClient(server, 10*time.Second)
 		if err2 == nil {
@@ -511,6 +514,9 @@ func handleAddServer(ctx context.Context, request mcp.CallToolRequest) (*mcp.Cal
 	cfgPath := resolveConfigPath()
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to load config %s (not overwriting it): %v", cfgPath, err)), nil
+		}
 		cfg = Config{Entries: make(map[string]Entry)}
 	}
 	if cfg.Entries == nil {

@@ -617,7 +617,10 @@ func newImportSSHConfigCommand() *cobra.Command {
 			}
 
 			cfgPath := resolveConfigPath()
-			cfg, _ := loadConfig(cfgPath)
+			cfg, err := loadConfig(cfgPath)
+			if err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("load config %s: %w", cfgPath, err)
+			}
 			if cfg.Entries == nil {
 				cfg.Entries = map[string]Entry{}
 			}
