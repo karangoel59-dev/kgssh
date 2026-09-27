@@ -316,9 +316,6 @@ func newAddCommand() *cobra.Command {
 			if host == "" {
 				return fmt.Errorf("host is required (pass user@host or use --host)")
 			}
-			if port == 0 {
-				port = 22
-			}
 
 			configPath := resolveConfigPath()
 			cfg, err := loadConfig(configPath)
@@ -350,6 +347,15 @@ func newAddCommand() *cobra.Command {
 				if password == "" && existing.Password != "" {
 					password = existing.Password
 				}
+				if port == 0 {
+					port = existing.Port
+				}
+				if extraArgs == nil {
+					extraArgs = existing.ExtraArgs
+				}
+			}
+			if port == 0 {
+				port = 22
 			}
 
 			cfg.Entries[alias] = Entry{
@@ -361,6 +367,7 @@ func newAddCommand() *cobra.Command {
 				ProxyJump:   proxyJump,
 				Description: description,
 				ExtraArgs:   extraArgs,
+				Info:        existing.Info,
 			}
 
 			if err := saveConfig(configPath, cfg); err != nil {
@@ -617,7 +624,10 @@ func newImportSSHConfigCommand() *cobra.Command {
 			}
 
 			cfgPath := resolveConfigPath()
-			cfg, _ := loadConfig(cfgPath)
+			cfg, err := loadConfig(cfgPath)
+			if err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("load config %s: %w", cfgPath, err)
+			}
 			if cfg.Entries == nil {
 				cfg.Entries = map[string]Entry{}
 			}

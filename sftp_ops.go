@@ -65,11 +65,15 @@ func WriteFileSFTP(client *ssh.Client, remotePath string, content string) (int, 
 	if err != nil {
 		return 0, fmt.Errorf("create %s: %w", remotePath, err)
 	}
-	defer f.Close()
 
 	n, err := f.Write([]byte(content))
 	if err != nil {
+		f.Close()
 		return n, fmt.Errorf("write %s: %w", remotePath, err)
+	}
+	// Close flushes buffered writes; its error means the data may not have landed.
+	if err := f.Close(); err != nil {
+		return n, fmt.Errorf("close %s: %w", remotePath, err)
 	}
 	return n, nil
 }

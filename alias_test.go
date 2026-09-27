@@ -109,7 +109,7 @@ func TestGenerateShellDefinitionAlias(t *testing.T) {
 	}
 
 	out := GenerateShellDefinition("prod-web", e, "", "alias", "zsh")
-	expected := `alias prod-web="ssh deploy@app.internal"` + "\n"
+	expected := `alias prod-web='ssh deploy@app.internal'` + "\n"
 	if out != expected {
 		t.Fatalf("expected %q, got %q", expected, out)
 	}
@@ -127,7 +127,7 @@ func TestGenerateShellDefinitionFish(t *testing.T) {
 	}
 
 	outAlias := GenerateShellDefinition("prod-web", e, "", "alias", "fish")
-	if !strings.Contains(outAlias, `alias prod-web "ssh deploy@app.internal"`) {
+	if !strings.Contains(outAlias, `alias prod-web 'ssh deploy@app.internal'`) {
 		t.Fatalf("unexpected fish alias: %s", outAlias)
 	}
 }

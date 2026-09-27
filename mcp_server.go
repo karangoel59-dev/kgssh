@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -285,8 +286,10 @@ func handleSSHExec(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallT
 		result, err = RunRemoteCommand(client, fullCmd, timeout, pty)
 	}
 
-	if err != nil {
-		// Stale connection or failed session, retry with fresh connection
+	if errors.Is(err, errSessionCreate) {
+		// Session never opened (stale pooled connection), so the command did not
+		// run; retry once on a fresh connection. Never retry after the command
+		// started (timeouts, transport errors) — it may still be running remotely.
 		globalPool.Close(server)
 		client, err2 := globalPool.GetClient(server, 10*time.Second)
 		if err2 == nil {
@@ -373,9 +376,10 @@ func handleTestConnection(ctx context.Context, request mcp.CallToolRequest) (*mc
 			port = 22
 		}
 
+		// Dial a dedicated connection rather than resetting the pooled one,
+		// which could be in use by a concurrent ssh_exec.
 		startT := time.Now()
-		globalPool.Close(target) // Ensure fresh connection
-		client, err := globalPool.GetClient(target, timeout)
+		client, err := dialEntry(entry, cfg.KeysDir, timeout)
 		if err != nil {
 			lat := float64(time.Since(startT).Milliseconds())
 			errMsg := strings.ReplaceAll(strings.ReplaceAll(err.Error(), "|", "\\|"), "\n", " ")
@@ -385,6 +389,7 @@ func handleTestConnection(ctx context.Context, request mcp.CallToolRequest) (*mc
 
 		res, err := RunRemoteCommand(client, "hostname", timeout, false)
 		lat := float64(time.Since(startT).Milliseconds())
+		_ = client.Close()
 		if err != nil {
 			errMsg := strings.ReplaceAll(strings.ReplaceAll(err.Error(), "|", "\\|"), "\n", " ")
 			lines = append(lines, fmt.Sprintf("| **%s** | `%s@%s:%d` | ❌ Failed | %.1fms | %s |", target, user, entry.Host, port, lat, errMsg))
@@ -431,7 +436,8 @@ func handleReadFile(ctx context.Context, request mcp.CallToolRequest) (*mcp.Call
 func handleWriteFile(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	server := argString(request, "server", "")
 	remotePath := argString(request, "remote_path", "")
-	content := argString(request, "content", "")
+	// Not argString: content must be written verbatim, without trimming.
+	content, _ := request.GetArguments()["content"].(string)
 
 	if server == "" || remotePath == "" {
 		return mcp.NewToolResultError("Parameters 'server' and 'remote_path' are required"), nil
@@ -492,14 +498,10 @@ func handleListDirectory(ctx context.Context, request mcp.CallToolRequest) (*mcp
 func handleAddServer(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	name := argString(request, "name", "")
 	host := argString(request, "host", "")
-	user := argString(request, "user", "root")
-	if user == "" {
-		user = "root"
-	}
-	port := argInt(request, "port", 22)
-	if port <= 0 {
-		port = 22
-	}
+	// user and port defaults are applied after merging with any existing entry,
+	// so updating a server doesn't reset them.
+	user := argString(request, "user", "")
+	port := argInt(request, "port", 0)
 	identityFile := argString(request, "identity_file", "")
 	password := argString(request, "password", "")
 	extraArgs := argStringSlice(request, "extra_args")
@@ -511,6 +513,9 @@ func handleAddServer(ctx context.Context, request mcp.CallToolRequest) (*mcp.Cal
 	cfgPath := resolveConfigPath()
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to load config %s (not overwriting it): %v", cfgPath, err)), nil
+		}
 		cfg = Config{Entries: make(map[string]Entry)}
 	}
 	if cfg.Entries == nil {
@@ -526,7 +531,14 @@ func handleAddServer(ctx context.Context, request mcp.CallToolRequest) (*mcp.Cal
 		ExtraArgs: extraArgs,
 	}
 
-	if existing, exists := cfg.Entries[name]; exists {
+	existing, exists := cfg.Entries[name]
+	if exists {
+		if entry.User == "" {
+			entry.User = existing.User
+		}
+		if entry.Port <= 0 {
+			entry.Port = existing.Port
+		}
 		if entry.Identity == "" && existing.Identity != "" {
 			entry.Identity = existing.Identity
 		}
@@ -545,6 +557,11 @@ func handleAddServer(ctx context.Context, request mcp.CallToolRequest) (*mcp.Cal
 		if existing.Info != nil {
 			entry.Info = existing.Info
 		}
+	} else if entry.User == "" {
+		entry.User = "root"
+	}
+	if entry.Port <= 0 {
+		entry.Port = 22
 	}
 
 	if identityFile != "" {
