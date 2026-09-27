@@ -14,11 +14,24 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
 
+type testServerOpts struct {
+	// hangGlobalRequests never answers global requests (e.g. keepalives),
+	// simulating a half-dead connection.
+	hangGlobalRequests bool
+	// serveSFTP accepts session channels and serves the local filesystem over SFTP.
+	serveSFTP bool
+}
+
 // startTestSSHServer accepts only the given public key and returns its port.
 func startTestSSHServer(t *testing.T, allowed ssh.PublicKey) int {
+	return startTestSSHServerWith(t, allowed, testServerOpts{})
+}
+
+func startTestSSHServerWith(t *testing.T, allowed ssh.PublicKey, opts testServerOpts) int {
 	t.Helper()
 
 	hostPriv, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -59,15 +72,163 @@ func startTestSSHServer(t *testing.T, allowed ssh.PublicKey) int {
 					return
 				}
 				defer sconn.Close()
-				go ssh.DiscardRequests(reqs)
+				if !opts.hangGlobalRequests {
+					go ssh.DiscardRequests(reqs)
+				}
 				for ch := range chans {
-					ch.Reject(ssh.Prohibited, "no channels in test")
+					if !opts.serveSFTP || ch.ChannelType() != "session" {
+						ch.Reject(ssh.Prohibited, "no channels in test")
+						continue
+					}
+					channel, chReqs, err := ch.Accept()
+					if err != nil {
+						continue
+					}
+					go serveSFTPSession(channel, chReqs)
 				}
 			}()
 		}
 	}()
 
 	return listener.Addr().(*net.TCPAddr).Port
+}
+
+func serveSFTPSession(channel ssh.Channel, reqs <-chan *ssh.Request) {
+	defer channel.Close()
+	for req := range reqs {
+		// Subsystem payload is an SSH string: 4-byte length + "sftp".
+		ok := req.Type == "subsystem" && len(req.Payload) >= 4 && string(req.Payload[4:]) == "sftp"
+		req.Reply(ok, nil)
+		if !ok {
+			continue
+		}
+		go ssh.DiscardRequests(reqs)
+		if srv, err := sftp.NewServer(channel); err == nil {
+			_ = srv.Serve()
+		}
+		return
+	}
+}
+
+// writeTestServerConfig points KGSSH_CONFIG at a config with the given entries
+// and resets the global pool around the test.
+func writeTestServerConfig(t *testing.T, entries map[string]Entry) {
+	t.Helper()
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	t.Setenv("KGSSH_CONFIG", configPath)
+	if err := saveConfig(configPath, Config{Entries: entries}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	globalPool.CloseAll()
+	t.Cleanup(globalPool.CloseAll)
+}
+
+// newTestKey writes a private key and returns its path and public key.
+func newTestKey(t *testing.T) (string, ssh.PublicKey) {
+	t.Helper()
+	path, err := writeTempSSHPrivateKey(t, t.TempDir(), "id_test")
+	if err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+	signer, err := loadSSHPrivateKey(path, "")
+	if err != nil {
+		t.Fatalf("load key: %v", err)
+	}
+	return path, signer.PublicKey()
+}
+
+func TestWriteFileKeepsContentVerbatim(t *testing.T) {
+	t.Setenv("SSH_AUTH_SOCK", "")
+	t.Setenv("HOME", t.TempDir())
+	keyPath, pub := newTestKey(t)
+	port := startTestSSHServerWith(t, pub, testServerOpts{serveSFTP: true})
+	writeTestServerConfig(t, map[string]Entry{
+		"local": {User: "deploy", Host: "127.0.0.1", Port: port, Identity: keyPath},
+	})
+
+	target := filepath.Join(t.TempDir(), "app.yaml")
+	content := "  indented: true\nlast: line\n\n"
+	res, err := handleWriteFile(context.Background(), mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name:      "write_file",
+			Arguments: map[string]any{"server": "local", "remote_path": target, "content": content},
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleWriteFile: %v", err)
+	}
+	if tc, ok := mcp.AsTextContent(res.Content[0]); !ok || !strings.Contains(tc.Text, "Successfully wrote") {
+		t.Fatalf("unexpected response: %#v", res.Content)
+	}
+
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read written file: %v", err)
+	}
+	if string(got) != content {
+		t.Fatalf("content changed:\ngot  %q\nwant %q", got, content)
+	}
+}
+
+func TestPoolHungServerDoesNotBlockOtherServers(t *testing.T) {
+	t.Setenv("SSH_AUTH_SOCK", "")
+	t.Setenv("HOME", t.TempDir())
+	oldProbe := keepaliveProbeTimeout
+	keepaliveProbeTimeout = time.Second
+	t.Cleanup(func() { keepaliveProbeTimeout = oldProbe })
+
+	keyPath, pub := newTestKey(t)
+	hungPort := startTestSSHServerWith(t, pub, testServerOpts{hangGlobalRequests: true})
+	okPort := startTestSSHServer(t, pub)
+	writeTestServerConfig(t, map[string]Entry{
+		"hung": {User: "deploy", Host: "127.0.0.1", Port: hungPort, Identity: keyPath},
+		"ok":   {User: "deploy", Host: "127.0.0.1", Port: okPort, Identity: keyPath},
+	})
+
+	first, err := globalPool.GetClient("hung", 5*time.Second)
+	if err != nil {
+		t.Fatalf("initial dial to hung server: %v", err)
+	}
+
+	// Reusing the pooled "hung" connection triggers a keepalive probe that never gets a reply.
+	hungDone := make(chan error, 1)
+	var second *ssh.Client
+	go func() {
+		c, err := globalPool.GetClient("hung", 5*time.Second)
+		second = c
+		hungDone <- err
+	}()
+	time.Sleep(100 * time.Millisecond) // let the probe start
+
+	okDone := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		_, err := globalPool.GetClient("ok", 5*time.Second)
+		okDone <- err
+	}()
+	select {
+	case err := <-okDone:
+		if err != nil {
+			t.Fatalf("dial ok server: %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > 700*time.Millisecond {
+			t.Fatalf("ok server waited %v behind the hung probe", elapsed)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("GetClient for a healthy server blocked behind a hung keepalive probe")
+	}
+
+	select {
+	case err := <-hungDone:
+		if err != nil {
+			t.Fatalf("redial after failed probe: %v", err)
+		}
+		if second == first {
+			t.Fatal("expected stale connection to be replaced after probe timeout")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("keepalive probe never timed out")
+	}
 }
 
 func TestDialFallsBackToDefaultKeyWhenExplicitIdentityRejected(t *testing.T) {

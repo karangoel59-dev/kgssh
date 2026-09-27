@@ -36,11 +36,14 @@ var globalPool = &SSHPool{
 	clients: make(map[string]*pooledClient),
 }
 
-// GetClient retrieves an active SSH client from the pool or opens a new connection.
-func (p *SSHPool) GetClient(serverName string, timeout time.Duration) (*ssh.Client, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+// keepaliveProbeTimeout bounds the health check on a pooled connection. Without
+// it, a half-dead TCP connection can block SendRequest for minutes.
+var keepaliveProbeTimeout = 5 * time.Second
 
+// GetClient retrieves an active SSH client from the pool or opens a new connection.
+// The pool lock is held only for map access, never during network I/O, so a slow
+// or hung server does not block calls to other servers.
+func (p *SSHPool) GetClient(serverName string, timeout time.Duration) (*ssh.Client, error) {
 	cfg, err := loadConfig(resolveConfigPath())
 	if err != nil {
 		return nil, fmt.Errorf("load config: %w", err)
@@ -51,16 +54,24 @@ func (p *SSHPool) GetClient(serverName string, timeout time.Duration) (*ssh.Clie
 		return nil, fmt.Errorf("server %q not found in configuration", serverName)
 	}
 
-	if pc, exists := p.clients[serverName]; exists && pc.client != nil {
-		// Probe connection health with a keepalive request
-		_, _, err := pc.client.SendRequest("keepalive@openssh.com", true, nil)
-		if err == nil {
+	p.mu.Lock()
+	pc := p.clients[serverName]
+	p.mu.Unlock()
+
+	if pc != nil && pc.client != nil {
+		if probeClient(pc.client, keepaliveProbeTimeout) {
+			p.mu.Lock()
 			pc.lastUsed = time.Now()
+			p.mu.Unlock()
 			return pc.client, nil
 		}
-		// Stale / disconnected connection, clean up
+		// Stale / disconnected connection: drop it unless another caller already replaced it.
 		_ = pc.client.Close()
-		delete(p.clients, serverName)
+		p.mu.Lock()
+		if p.clients[serverName] == pc {
+			delete(p.clients, serverName)
+		}
+		p.mu.Unlock()
 	}
 
 	client, err := dialEntry(entry, cfg.KeysDir, timeout)
@@ -68,11 +79,36 @@ func (p *SSHPool) GetClient(serverName string, timeout time.Duration) (*ssh.Clie
 		return nil, err
 	}
 
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if other := p.clients[serverName]; other != nil && other != pc && other.client != nil {
+		// A concurrent caller dialed first; share its connection and discard ours.
+		_ = client.Close()
+		other.lastUsed = time.Now()
+		return other.client, nil
+	}
 	p.clients[serverName] = &pooledClient{
 		client:   client,
 		lastUsed: time.Now(),
 	}
 	return client, nil
+}
+
+// probeClient reports whether client answers a keepalive within timeout.
+func probeClient(client *ssh.Client, timeout time.Duration) bool {
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		return err == nil
+	case <-time.After(timeout):
+		// Closing the client unblocks the pending SendRequest goroutine.
+		_ = client.Close()
+		return false
+	}
 }
 
 // Close closes and removes a client connection for a server from the pool.
