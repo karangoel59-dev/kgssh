@@ -15,7 +15,7 @@ import (
 )
 
 // version is overridden at release build time via -ldflags "-X main.version=...".
-var version = "2.1.1"
+var version = "2.1.3"
 
 var builtinCommands = map[string]bool{
 	"add":               true,
