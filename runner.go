@@ -7,13 +7,15 @@ import (
 )
 
 // RunSSH launches native OpenSSH for an Entry, passing along any trailing arguments.
-func RunSSH(e Entry, keysDir string, extraArgs []string) error {
+// The alias is needed so entries that delegate to ssh_config can hand it to ssh
+// as the destination and let OpenSSH resolve it.
+func RunSSH(alias string, e Entry, keysDir string, extraArgs []string) error {
 	sshPath, err := exec.LookPath("ssh")
 	if err != nil {
 		return fmt.Errorf("ssh binary not found in PATH: %w", err)
 	}
 
-	sshArgs := BuildSSHArgs(e, keysDir, false)
+	sshArgs := BuildSSHArgs(alias, e, keysDir, false)
 	sshArgs = append(sshArgs, extraArgs...)
 
 	var cmd *exec.Cmd

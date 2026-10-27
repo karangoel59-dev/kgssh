@@ -55,9 +55,14 @@ type Config struct {
 }
 
 // Entry represents an individual SSH alias target.
+//
+// Connection fields are optional. An entry with no Host delegates resolution to
+// OpenSSH: kgssh passes the alias to ssh and ~/.ssh/config decides the hostname,
+// user, port and identity. Such an entry carries only kgssh-specific data —
+// descriptions and operational playbooks — which ssh_config cannot express.
 type Entry struct {
-	User        string      `json:"user"`
-	Host        string      `json:"host"`
+	User        string      `json:"user,omitempty"`
+	Host        string      `json:"host,omitempty"`
 	Port        int         `json:"port,omitempty"`
 	Password    string      `json:"password,omitempty"`
 	Identity    string      `json:"identity,omitempty"`
@@ -220,6 +225,58 @@ func (e Entry) ResolvedIdentity(keysDir string) string {
 		}
 	}
 	return ""
+}
+
+// DelegatesToSSHConfig reports whether the entry leaves its connection facts to
+// OpenSSH. Omitting the host is the opt-in: there is then exactly one copy of
+// those facts, in ~/.ssh/config, and nothing for kgssh to keep in sync.
+func (e Entry) DelegatesToSSHConfig() bool {
+	return strings.TrimSpace(e.Host) == ""
+}
+
+// Effective returns the entry with any connection facts it does not state
+// filled in from ssh_config. Fields set on the entry win, so an entry can
+// override one setting (a different user, say) without restating the rest.
+//
+// For entries that carry their own host this is a no-op, so existing configs
+// behave exactly as before.
+func (e Entry) Effective(alias, keysDir string) (Entry, error) {
+	if !e.DelegatesToSSHConfig() {
+		return e, nil
+	}
+	if alias == "" {
+		return e, fmt.Errorf("entry has no host and no alias to resolve from ssh_config")
+	}
+
+	target, err := ResolveSSHConfig(alias)
+	if err != nil {
+		return e, fmt.Errorf("resolve %q from ssh_config: %w", alias, err)
+	}
+	if target.Unresolved() {
+		return e, fmt.Errorf("alias %q has no host in the kgssh entry and no HostName in ssh_config", alias)
+	}
+
+	resolved := e
+	resolved.Host = target.HostName
+	if resolved.User == "" {
+		resolved.User = target.User
+	}
+	if resolved.Port <= 0 {
+		resolved.Port = target.Port
+	}
+	if resolved.ProxyJump == "" {
+		resolved.ProxyJump = target.ProxyJump
+	}
+	if resolved.ResolvedIdentity(keysDir) == "" {
+		for _, candidate := range target.IdentityFiles {
+			if _, err := os.Stat(expandPath(candidate)); err == nil {
+				resolved.Identity = candidate
+				break
+			}
+		}
+	}
+
+	return resolved, nil
 }
 
 // GetDescription returns the alias description, falling back to ServerInfo description if available.

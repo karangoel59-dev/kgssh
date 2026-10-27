@@ -12,10 +12,14 @@ import (
 
 // BuildSSHArgs constructs the argument slice for the ssh command.
 // If portable is true, identities under $HOME are displayed as ~/.ssh/...
-func BuildSSHArgs(e Entry, keysDir string, portable bool) []string {
+//
+// When the entry delegates to ssh_config, the alias itself is passed to ssh as
+// the target and OpenSSH resolves it. Only fields the entry states explicitly
+// are emitted as flags, so they override ssh_config without duplicating it.
+func BuildSSHArgs(alias string, e Entry, keysDir string, portable bool) []string {
 	var args []string
 
-	if e.Port > 0 && e.Port != 22 {
+	if e.Port > 0 && (e.Port != 22 || e.DelegatesToSSHConfig()) {
 		args = append(args, "-p", strconv.Itoa(e.Port))
 	}
 
@@ -42,13 +46,36 @@ func BuildSSHArgs(e Entry, keysDir string, portable bool) []string {
 		args = append(args, arg)
 	}
 
-	target := e.Host
-	if e.User != "" {
-		target = e.User + "@" + e.Host
-	}
-	args = append(args, target)
+	args = append(args, sshTarget(alias, e))
 
 	return args
+}
+
+// describeTarget renders an entry's destination for human-facing output,
+// without paying for an ssh_config lookup.
+func describeTarget(alias string, e Entry) string {
+	if e.DelegatesToSSHConfig() {
+		return alias + " via ssh_config"
+	}
+	if e.User != "" {
+		return e.User + "@" + e.Host
+	}
+	return e.Host
+}
+
+// sshTarget returns what to hand ssh as its destination: the bare alias when
+// ssh_config owns the connection, otherwise the usual [user@]host.
+func sshTarget(alias string, e Entry) string {
+	if e.DelegatesToSSHConfig() {
+		if e.User != "" {
+			return e.User + "@" + alias
+		}
+		return alias
+	}
+	if e.User != "" {
+		return e.User + "@" + e.Host
+	}
+	return e.Host
 }
 
 // shellQuote quotes s for POSIX shells using single quotes, so $, backticks,
@@ -82,7 +109,7 @@ func shellQuote(s string) string {
 // Passwords are passed via the SSHPASS environment variable (sshpass -e)
 // rather than -p, so they don't appear in the process list.
 func BuildSSHCommandString(name string, e Entry, keysDir string) string {
-	args := BuildSSHArgs(e, keysDir, true)
+	args := BuildSSHArgs(name, e, keysDir, true)
 	var parts []string
 	if e.Password != "" {
 		parts = append(parts, "SSHPASS="+shellQuote(e.Password), "sshpass", "-e")

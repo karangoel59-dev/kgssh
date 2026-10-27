@@ -22,7 +22,8 @@
   - Inspect resolved command: `kgssh cmd prod1`
 - **Automatic Syncing**: Any `kgssh add`, `kgssh remove`, or MCP mutation automatically refreshes `~/.kgssh/aliases.sh`.
 - **Cross-Platform Identity Resolution**: Automatically detects and heals key paths across environments (e.g. Linux `/home/...` to macOS `~/.ssh/...`).
-- **OpenSSH Import**: Easily import existing `Host` blocks from `~/.ssh/config` using `kgssh import-ssh-config`.
+- **ssh_config as the Source of Truth**: An entry may omit `host` entirely. kgssh then passes the alias straight to `ssh` and lets OpenSSH resolve it (`ssh -G`), so `~/.ssh/config` stays the single copy of your connection facts — `Host` blocks, `Match` rules, `Include` files, `ProxyJump` and per-host `IdentityFile` all apply, and there is nothing to keep in sync. Such an entry holds only what ssh_config cannot express: descriptions and operational playbooks.
+- **OpenSSH Import**: Easily import existing `Host` blocks from `~/.ssh/config` using `kgssh import-ssh-config`, or `--link` them so the facts are never copied at all.
 - **Full OpenSSH Compatibility**: Leverages your system `ssh` binary directly, ensuring full support for agent forwarding, tmux, vim, escape sequences, and native PTY.
 
 ---
@@ -126,11 +127,58 @@ kgssh sync --install
 # Preview what would be imported
 kgssh import-ssh-config --dry-run
 
-# Import hosts
+# Import hosts (copies host/user/port/identity into kgssh's config)
 kgssh import-ssh-config
 
 # Overwrite existing aliases if duplicate names match
 kgssh import-ssh-config --overwrite
+
+# Link instead of copy: record alias names only and resolve from ssh_config
+kgssh import-ssh-config --link --overwrite
+```
+
+#### Linked (ssh_config-backed) entries
+
+A plain import copies each host's connection facts into `~/.kgssh/config.json`.
+They then exist in two files and can drift apart — change a key path in
+`~/.ssh/config` and kgssh keeps using the old one until you re-import.
+
+`--link` avoids that by storing only the alias:
+
+```json
+{
+  "entries": {
+    "gcloud-work": {
+      "description": "GCP Work VM",
+      "info": { "notes": "..." }
+    }
+  }
+}
+```
+
+With no `host`, kgssh resolves the connection through OpenSSH at call time:
+
+```bash
+$ kgssh cmd gcloud-work
+ssh gcloud-work                       # ssh does the lookup
+
+$ kgssh show gcloud-work
+Target:      gcloud-work via ssh_config
+Source:      ssh_config (resolved by OpenSSH at call time)
+Host:        10.66.66.5               # resolved, not stored
+User:        azureuser
+Identity:    ~/.ssh/id_ed25519
+```
+
+Any field you *do* set on the entry overrides ssh_config for that field only, so
+you can change the user without restating the host. Entries that carry their own
+`host` are untouched and behave exactly as before. MCP tools resolve the same
+way, so `ssh_exec`, `test_connection` and `get_server_info` all follow
+`~/.ssh/config` too.
+
+Existing playbooks are preserved when re-linking: `--link` keeps the
+`description`, `info` and `extraArgs` of an entry it replaces.
+
 ### 8. Test Connectivity & Latency
 ```bash
 # Test all configured servers
