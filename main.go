@@ -74,7 +74,7 @@ and serves high-performance remote execution and SFTP tools over MCP.`,
 			if !ok {
 				return fmt.Errorf("unknown command or alias: %q\nRun 'kgssh list' to see configured aliases", aliasName)
 			}
-			return RunSSH(entry, cfg.KeysDir, args[1:])
+			return RunSSH(args[0], entry, cfg.KeysDir, args[1:])
 		},
 	}
 
@@ -104,10 +104,10 @@ and serves high-performance remote execution and SFTP tools over MCP.`,
 		targetEntry := entry
 		aliasCmd := &cobra.Command{
 			Use:                targetName + " [flags/remote-args...]",
-			Short:              fmt.Sprintf("Connect to %s (%s)", targetName, targetEntry.Host),
+			Short:              fmt.Sprintf("Connect to %s (%s)", targetName, describeTarget(targetName, targetEntry)),
 			DisableFlagParsing: true,
 			RunE: func(cmd *cobra.Command, args []string) error {
-				return RunSSH(targetEntry, cfg.KeysDir, args)
+				return RunSSH(targetName, targetEntry, cfg.KeysDir, args)
 			},
 		}
 		root.AddCommand(aliasCmd)
@@ -174,11 +174,8 @@ func newListCommand() *cobra.Command {
 				fmt.Fprintln(w, "-----\t------\t--------\t-----------")
 				for _, name := range names {
 					entry := cfg.Entries[name]
-					target := entry.Host
-					if entry.User != "" {
-						target = entry.User + "@" + entry.Host
-					}
-					if entry.Port > 0 && entry.Port != 22 {
+					target := describeTarget(name, entry)
+					if !entry.DelegatesToSSHConfig() && entry.Port > 0 && entry.Port != 22 {
 						target = fmt.Sprintf("%s:%d", target, entry.Port)
 					}
 
@@ -224,16 +221,25 @@ func newShowCommand() *cobra.Command {
 				return fmt.Errorf("unknown SSH alias: %q", args[0])
 			}
 
-			target := entry.Host
-			if entry.User != "" {
-				target = entry.User + "@" + entry.Host
-			}
-			if entry.Port > 0 {
+			target := describeTarget(args[0], entry)
+			if !entry.DelegatesToSSHConfig() && entry.Port > 0 {
 				target = fmt.Sprintf("%s:%d", target, entry.Port)
 			}
 
+			// Built before resolution: this is the command kgssh actually runs.
+			cmdStr := BuildSSHCommandString(args[0], entry, cfg.KeysDir)
+
 			fmt.Printf("Alias:       %s\n", args[0])
 			fmt.Printf("Target:      %s\n", target)
+			if entry.DelegatesToSSHConfig() {
+				fmt.Printf("Source:      ssh_config (resolved by OpenSSH at call time)\n")
+				fmt.Printf("Resolved below from ssh_config; not stored by kgssh.\n")
+				if resolved, err := entry.Effective(args[0], cfg.KeysDir); err == nil {
+					entry = resolved
+				} else {
+					fmt.Printf("Resolve:     %s\n", err.Error())
+				}
+			}
 			fmt.Printf("Host:        %s\n", entry.Host)
 			if entry.User != "" {
 				fmt.Printf("User:        %s\n", entry.User)
@@ -253,7 +259,7 @@ func newShowCommand() *cobra.Command {
 			if len(entry.ExtraArgs) > 0 {
 				fmt.Printf("Extra Args:  %s\n", strings.Join(entry.ExtraArgs, " "))
 			}
-			fmt.Printf("SSH Command: %s\n", BuildSSHCommandString(args[0], entry, cfg.KeysDir))
+			fmt.Printf("SSH Command: %s\n", cmdStr)
 
 			return nil
 		},
@@ -462,7 +468,7 @@ func newRunCommand() *cobra.Command {
 				return fmt.Errorf("unknown SSH alias: %q\nRun 'kgssh list' to view aliases", aliasName)
 			}
 
-			return RunSSH(entry, cfg.KeysDir, args[1:])
+			return RunSSH(args[0], entry, cfg.KeysDir, args[1:])
 		},
 	}
 }
@@ -485,7 +491,7 @@ func newConnectCommand() *cobra.Command {
 				return fmt.Errorf("unknown SSH alias: %q", aliasName)
 			}
 
-			return RunSSH(entry, cfg.KeysDir, args[1:])
+			return RunSSH(args[0], entry, cfg.KeysDir, args[1:])
 		},
 	}
 }
@@ -605,12 +611,20 @@ func newSyncCommand() *cobra.Command {
 }
 
 func newImportSSHConfigCommand() *cobra.Command {
-	var overwrite, dryRun, noSync bool
+	var overwrite, dryRun, noSync, link bool
 
 	cmd := &cobra.Command{
 		Use:   "import-ssh-config [path]",
 		Short: "Import SSH aliases from OpenSSH ~/.ssh/config",
-		Args:  cobra.MaximumNArgs(1),
+		Long: `Import Host blocks from an OpenSSH config.
+
+By default the connection facts are copied into kgssh's config, which means they
+then exist in two places and can drift apart.
+
+With --link, kgssh records only the alias name and lets ssh_config stay the
+single source of truth: connections are resolved with 'ssh -G' at call time, so
+editing ~/.ssh/config is enough and there is nothing to re-import.`,
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			configPath := ""
 			if len(args) > 0 {
@@ -645,6 +659,17 @@ func newImportSSHConfigCommand() *cobra.Command {
 					fmt.Printf("Skipping existing alias %q (use --overwrite to replace)\n", name)
 					continue
 				}
+				if link {
+					// Keep only what ssh_config cannot express; preserve any
+					// playbook already attached to an existing entry.
+					linked := Entry{Description: entry.Description}
+					if existing, ok := cfg.Entries[name]; ok {
+						linked.Description = existing.Description
+						linked.Info = existing.Info
+						linked.ExtraArgs = existing.ExtraArgs
+					}
+					entry = linked
+				}
 				if dryRun {
 					fmt.Printf("[dry-run] Would import %s -> %s\n", name, BuildSSHCommandString(name, entry, cfg.KeysDir))
 				} else {
@@ -676,6 +701,7 @@ func newImportSSHConfigCommand() *cobra.Command {
 		},
 	}
 
+	cmd.Flags().BoolVar(&link, "link", false, "Record alias names only and resolve connections from ssh_config at call time")
 	cmd.Flags().BoolVar(&overwrite, "overwrite", false, "Overwrite existing aliases with same name")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Preview imports without modifying configuration")
 	cmd.Flags().BoolVar(&noSync, "no-sync", false, "Skip auto-syncing ~/.kgssh/aliases.sh")

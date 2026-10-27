@@ -18,7 +18,7 @@ func TestBuildSSHArgs(t *testing.T) {
 		ExtraArgs: []string{"-C", "-o", "StrictHostKeyChecking=no"},
 	}
 
-	args := BuildSSHArgs(e, "", true)
+	args := BuildSSHArgs("test-server", e, "", true)
 	expected := []string{
 		"-p", "2222",
 		"-i", "~/.ssh/id_rsa",
@@ -39,7 +39,7 @@ func TestBuildSSHArgsOmitsPort22(t *testing.T) {
 		Port: 22,
 	}
 
-	args := BuildSSHArgs(e, "", true)
+	args := BuildSSHArgs("test-server", e, "", true)
 	expected := []string{"root@1.2.3.4"}
 
 	if !reflect.DeepEqual(args, expected) {
@@ -55,7 +55,7 @@ func TestBuildSSHArgsExtractsIdentityFromExtraArgs(t *testing.T) {
 		ExtraArgs: []string{"-i", "/custom/key", "-o", "ConnectTimeout=5"},
 	}
 
-	args := BuildSSHArgs(e, "", true)
+	args := BuildSSHArgs("test-server", e, "", true)
 	expected := []string{
 		"-i", "/custom/key",
 		"-o", "ConnectTimeout=5",

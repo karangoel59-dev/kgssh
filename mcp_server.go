@@ -207,13 +207,17 @@ func handleListServers(ctx context.Context, request mcp.CallToolRequest) (*mcp.C
 
 	for _, name := range names {
 		entry := cfg.Entries[name]
+		// Show what OpenSSH would actually use for ssh_config-backed entries.
+		if resolved, err := entry.Effective(name, cfg.KeysDir); err == nil {
+			entry = resolved
+		}
 		user := entry.User
 		if user == "" {
 			user = "root"
 		}
 		host := entry.Host
 		if host == "" {
-			host = "unknown"
+			host = "unresolved (not in ssh_config)"
 		}
 		port := entry.Port
 		if port <= 0 {
@@ -366,6 +370,13 @@ func handleTestConnection(ctx context.Context, request mcp.CallToolRequest) (*mc
 			lines = append(lines, fmt.Sprintf("| **%s** | - | ❌ Unknown | - | Server not found in configuration |", target))
 			continue
 		}
+
+		resolved, resolveErr := entry.Effective(target, cfg.KeysDir)
+		if resolveErr != nil {
+			lines = append(lines, fmt.Sprintf("| **%s** | - | ❌ Unresolved | - | %s |", target, resolveErr.Error()))
+			continue
+		}
+		entry = resolved
 
 		user := entry.User
 		if user == "" {
@@ -619,13 +630,17 @@ func handleRemoveServer(ctx context.Context, request mcp.CallToolRequest) (*mcp.
 }
 
 func formatServerInfo(name string, entry Entry, keysDir string) string {
+	fromSSHConfig := entry.DelegatesToSSHConfig()
+	if resolved, err := entry.Effective(name, keysDir); err == nil {
+		entry = resolved
+	}
 	user := entry.User
 	if user == "" {
 		user = "root"
 	}
 	host := entry.Host
 	if host == "" {
-		host = "unknown"
+		host = "unresolved (not in ssh_config)"
 	}
 	port := entry.Port
 	if port <= 0 {
@@ -688,7 +703,11 @@ func formatServerInfo(name string, entry Entry, keysDir string) string {
 
 	var lines []string
 	lines = append(lines, fmt.Sprintf("### 🖥️ Server Profile: `%s`", name))
-	lines = append(lines, fmt.Sprintf("- **Connection:** `%s@%s:%d`", user, host, port))
+	connection := fmt.Sprintf("`%s@%s:%d`", user, host, port)
+	if fromSSHConfig {
+		connection += " _(resolved from ssh_config)_"
+	}
+	lines = append(lines, "- **Connection:** "+connection)
 	lines = append(lines, fmt.Sprintf("- **Authentication:** %s", authDesc))
 
 	if len(entry.ExtraArgs) > 0 {
@@ -765,9 +784,12 @@ func handleGetServerInfo(ctx context.Context, request mcp.CallToolRequest) (*mcp
 
 		for _, name := range names {
 			entry := cfg.Entries[name]
+			if resolved, err := entry.Effective(name, cfg.KeysDir); err == nil {
+				entry = resolved
+			}
 			host := entry.Host
 			if host == "" {
-				host = "unknown"
+				host = "unresolved (not in ssh_config)"
 			}
 			desc := entry.GetDescription()
 			if desc == "" {

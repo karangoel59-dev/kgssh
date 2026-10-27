@@ -74,7 +74,14 @@ func (p *SSHPool) GetClient(serverName string, timeout time.Duration) (*ssh.Clie
 		p.mu.Unlock()
 	}
 
-	client, err := dialEntry(entry, cfg.KeysDir, timeout)
+	// Entries that omit their host are resolved through ssh_config here: the
+	// native dialer needs a concrete address, user and key.
+	resolved, err := entry.Effective(serverName, cfg.KeysDir)
+	if err != nil {
+		return nil, err
+	}
+
+	client, err := dialEntry(resolved, cfg.KeysDir, timeout)
 	if err != nil {
 		return nil, err
 	}
