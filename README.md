@@ -29,6 +29,28 @@
 
 ---
 
+## Installation
+
+**Prebuilt binary** — from the [latest release](https://github.com/karangoel59-dev/kgssh/releases/latest):
+
+```bash
+# macOS (Apple Silicon); swap the asset name for your platform:
+#   kgssh-darwin-arm64, kgssh-darwin-amd64, kgssh-linux-amd64, kgssh-linux-arm64
+curl -fsSL -o kgssh \
+  https://github.com/karangoel59-dev/kgssh/releases/latest/download/kgssh-darwin-arm64
+chmod +x kgssh && sudo mv kgssh /usr/local/bin/
+```
+
+**From source** (Go 1.25+):
+
+```bash
+go install github.com/karangoel59-dev/kgssh/v2@latest
+```
+
+Check what you have with `kgssh --version`.
+
+---
+
 ## Quick Start & Shell Setup
 
 To install the aliases into your current shell (`~/.zshrc` or `~/.bashrc`), simply run:
@@ -237,6 +259,25 @@ kgssh info agentic-stage
 kgssh mcp
 ```
 
+#### Available MCP Tools
+
+| Tool | Purpose |
+| :--- | :--- |
+| `list_servers` | List configured servers, resolved targets and auth methods |
+| `ssh_exec` | Run a command remotely, with timeout, PTY and pooled connections |
+| `test_connection` | Check reachability and latency |
+| `read_file` | Read remote text through the conversation (capped, truncates) |
+| `write_file` | Write text content to a remote file |
+| `upload_file` | Stream a local file or directory to the host (scp equivalent) |
+| `download_file` | Stream a remote file or directory to disk (scp equivalent) |
+| `list_directory` | List a remote directory with file details |
+| `add_server` / `remove_server` | Manage entries, auto-syncing shell aliases |
+| `get_server_info` / `update_server_info` | Read and write operational playbooks |
+
+For file transfer, prefer `upload_file` / `download_file` over
+`read_file` / `write_file`: they stream bytes between disk and the host, so
+binaries and large files work and the content never enters the conversation.
+
 #### MCP Integration Config
 Add to your MCP configuration (e.g. `~/.gemini/config/mcp_config.json` or Claude Desktop):
 
@@ -260,19 +301,31 @@ Add to your MCP configuration (e.g. `~/.gemini/config/mcp_config.json` or Claude
 
 Stored in `~/.kgssh/config.json` (or override with `KGSSH_CONFIG` environment variable):
 
-```json
+```jsonc
 {
   "entries": {
+    // Self-contained: kgssh holds the connection facts.
     "prod1": {
       "user": "root",
       "host": "159.89.171.7",
       "port": 22,
       "identity": "~/.ssh/dev_chat360"
+    },
+
+    // Linked: no host, so ~/.ssh/config is the single source of truth and
+    // OpenSSH resolves the connection at call time. The entry carries only
+    // what ssh_config cannot express.
+    "gcloud-work": {
+      "description": "GCP Work VM",
+      "info": { "notes": "Celery concurrency must stay at 1." }
     }
   },
   "keysDir": "~/.ssh"
 }
 ```
+
+Run `kgssh import-ssh-config --link` to convert existing `~/.ssh/config` hosts
+into linked entries.
 
 ---
 
