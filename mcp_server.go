@@ -134,7 +134,27 @@ func BuildMCPServer() *server.MCPServer {
 		mcp.WithString("remote_path", mcp.Description("Directory path on remote server (default: '.')")),
 	), handleListDirectory)
 
-	// 7. add_server
+	// 7. upload_file
+	s.AddTool(mcp.NewTool("upload_file",
+		mcp.WithDescription("Copy a local file or directory to a remote server over SFTP (scp equivalent).\n\nUse this instead of write_file to transfer files on disk: the bytes are streamed\nand never pass through the conversation, so binaries and large files work.\n\nArgs:\n    server: Name of configured server\n    local_path: Path of the local file or directory to send\n    remote_path: Destination path on the remote server. An existing remote directory receives the source's base name inside it, as scp does.\n    recursive: Required to transfer a directory (default: false)\n    overwrite: Replace existing destination files (default: false, which fails instead of clobbering)\n"),
+		mcp.WithString("server", mcp.Required(), mcp.Description("Name of configured server")),
+		mcp.WithString("local_path", mcp.Required(), mcp.Description("Path of the local file or directory to send")),
+		mcp.WithString("remote_path", mcp.Required(), mcp.Description("Destination path on the remote server")),
+		mcp.WithBoolean("recursive", mcp.Description("Required to transfer a directory (default: false)")),
+		mcp.WithBoolean("overwrite", mcp.Description("Replace existing destination files (default: false)")),
+	), handleUploadFile)
+
+	// 8. download_file
+	s.AddTool(mcp.NewTool("download_file",
+		mcp.WithDescription("Copy a file or directory from a remote server to the local filesystem over SFTP (scp equivalent).\n\nUse this instead of read_file when the content should land on disk rather than\nbe read: the bytes are streamed, so binaries and large files work and nothing is\ntruncated. Local file permissions are taken from the remote file.\n\nArgs:\n    server: Name of configured server\n    remote_path: Path of the remote file or directory to fetch\n    local_path: Local destination path. An existing local directory receives the source's base name inside it, as scp does.\n    recursive: Required to transfer a directory (default: false)\n    overwrite: Replace existing destination files (default: false, which fails instead of clobbering)\n"),
+		mcp.WithString("server", mcp.Required(), mcp.Description("Name of configured server")),
+		mcp.WithString("remote_path", mcp.Required(), mcp.Description("Path of the remote file or directory to fetch")),
+		mcp.WithString("local_path", mcp.Required(), mcp.Description("Local destination path")),
+		mcp.WithBoolean("recursive", mcp.Description("Required to transfer a directory (default: false)")),
+		mcp.WithBoolean("overwrite", mcp.Description("Replace existing destination files (default: false)")),
+	), handleDownloadFile)
+
+	// 9. add_server
 	s.AddTool(mcp.NewTool("add_server",
 		mcp.WithDescription("Add or update an SSH server configuration profile.\n\nArgs:\n    name: Unique alias identifier for the server (e.g. 'staging-api')\n    host: IP address or hostname\n    user: SSH user (default: 'root')\n    port: SSH port (default: 22)\n    identity_file: Optional path to private key (e.g. '~/.ssh/id_rsa')\n    password: Optional SSH password\n    extra_args: Optional list of additional SSH arguments (e.g. ['-o', 'StrictHostKeyChecking=no'])\n"),
 		mcp.WithString("name", mcp.Required(), mcp.Description("Unique alias identifier for the server")),
@@ -146,19 +166,19 @@ func BuildMCPServer() *server.MCPServer {
 		mcp.WithArray("extra_args", mcp.Description("Optional list of additional SSH arguments"), mcp.WithStringItems()),
 	), handleAddServer)
 
-	// 8. remove_server
+	// 10. remove_server
 	s.AddTool(mcp.NewTool("remove_server",
 		mcp.WithDescription("Remove an SSH server from configuration.\n\nArgs:\n    name: Alias of server to remove\n"),
 		mcp.WithString("name", mcp.Required(), mcp.Description("Alias of server to remove")),
 	), handleRemoveServer)
 
-	// 9. get_server_info
+	// 11. get_server_info
 	s.AddTool(mcp.NewTool("get_server_info",
 		mcp.WithDescription("Retrieve operational context, architecture description, running services,\nkey log paths, and troubleshooting checklists for a configured SSH server (or all servers).\n\nArgs:\n    server: Name of configured server (e.g. 'agentic-stage'). If 'all' or empty, returns an overview summary of all configured servers.\n"),
 		mcp.WithString("server", mcp.Description("Name of configured server (e.g. 'agentic-stage'). If 'all' or empty, returns an overview summary of all configured servers.")),
 	), handleGetServerInfo)
 
-	// 10. update_server_info
+	// 12. update_server_info
 	s.AddTool(mcp.NewTool("update_server_info",
 		mcp.WithDescription("Update documentation, architecture info, key services, log paths, and troubleshooting checklists for a configured server.\nPreserves connection details and only modifies fields that are explicitly provided.\n\nArgs:\n    server: Name of the configured server to update (e.g. 'agentic-stage')\n    description: High-level overview of the server's role and architecture\n    services: List of key services running on this server (e.g. ['Gunicorn (Django API)', 'Celery (8 workers)', 'Qdrant'])\n    what_to_check: Checklist or instructions for diagnosing issues (commands, metrics, health checks)\n    log_paths: List of important log file paths and directories to monitor\n    notes: Important operational caveats, port mappings, credentials, or environment details\n"),
 		mcp.WithString("server", mcp.Required(), mcp.Description("Name of the configured server to update (e.g. 'agentic-stage')")),
@@ -504,6 +524,62 @@ func handleListDirectory(ctx context.Context, request mcp.CallToolRequest) (*mcp
 	}
 
 	return mcp.NewToolResultText(strings.Join(lines, "\n")), nil
+}
+
+func handleUploadFile(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	server := argString(request, "server", "")
+	localPath := argString(request, "local_path", "")
+	remotePath := argString(request, "remote_path", "")
+	recursive := argBool(request, "recursive", false)
+	overwrite := argBool(request, "overwrite", false)
+
+	if server == "" || localPath == "" || remotePath == "" {
+		return mcp.NewToolResultError("Parameters 'server', 'local_path' and 'remote_path' are required"), nil
+	}
+
+	client, err := globalPool.GetClient(server, 10*time.Second)
+	if err != nil {
+		return mcp.NewToolResultText(fmt.Sprintf("❌ Failed to connect to '%s': %v", server, err)), nil
+	}
+
+	stats, err := UploadSFTP(ctx, client, localPath, remotePath, recursive, overwrite)
+	if err != nil {
+		out := fmt.Sprintf("❌ Upload of `%s` to `%s` on `%s` failed: %v", localPath, remotePath, server, err)
+		if stats.Files > 0 {
+			out += fmt.Sprintf("\n\n⚠️ Partial transfer: %d file(s), %s already written.", stats.Files, formatBytes(stats.Bytes))
+		}
+		return mcp.NewToolResultText(out), nil
+	}
+
+	return mcp.NewToolResultText(formatTransferSummary("Uploaded", localPath, server+":"+remotePath, stats)), nil
+}
+
+func handleDownloadFile(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	server := argString(request, "server", "")
+	remotePath := argString(request, "remote_path", "")
+	localPath := argString(request, "local_path", "")
+	recursive := argBool(request, "recursive", false)
+	overwrite := argBool(request, "overwrite", false)
+
+	if server == "" || remotePath == "" || localPath == "" {
+		return mcp.NewToolResultError("Parameters 'server', 'remote_path' and 'local_path' are required"), nil
+	}
+
+	client, err := globalPool.GetClient(server, 10*time.Second)
+	if err != nil {
+		return mcp.NewToolResultText(fmt.Sprintf("❌ Failed to connect to '%s': %v", server, err)), nil
+	}
+
+	stats, err := DownloadSFTP(ctx, client, remotePath, localPath, recursive, overwrite)
+	if err != nil {
+		out := fmt.Sprintf("❌ Download of `%s` from `%s` to `%s` failed: %v", remotePath, server, localPath, err)
+		if stats.Files > 0 {
+			out += fmt.Sprintf("\n\n⚠️ Partial transfer: %d file(s), %s already written.", stats.Files, formatBytes(stats.Bytes))
+		}
+		return mcp.NewToolResultText(out), nil
+	}
+
+	return mcp.NewToolResultText(formatTransferSummary("Downloaded", server+":"+remotePath, localPath, stats)), nil
 }
 
 func handleAddServer(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
