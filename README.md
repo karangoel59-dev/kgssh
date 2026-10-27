@@ -11,6 +11,7 @@
   - `ssh_exec`: Execute shell commands on remote servers with timeout, PTY, and connection pooling.
   - `test_connection`: Test connectivity and latency to servers.
   - `read_file` / `write_file` / `list_directory`: Secure SFTP file reading, writing, and directory listing.
+  - `upload_file` / `download_file`: scp-equivalent file and directory transfer over SFTP. Bytes are streamed between disk and the remote host, so binaries and large files work and nothing passes through the conversation.
   - `add_server` / `remove_server`: Add/remove servers with instant auto-sync to shell aliases.
   - `get_server_info` / `update_server_info`: Store and inspect operational playbooks, key services, health checks, and log paths.
 - **Native Shell Functions & Aliases**: Generates functions like `prod1() { ssh ... "$@"; }` allowing direct terminal usage (`prod1`, `prod1 "ls -la"`, `prod1 -L 8080:localhost:8080`).
@@ -179,7 +180,40 @@ way, so `ssh_exec`, `test_connection` and `get_server_info` all follow
 Existing playbooks are preserved when re-linking: `--link` keeps the
 `description`, `info` and `extraArgs` of an entry it replaces.
 
-### 8. Test Connectivity & Latency
+### 8. Transfer Files over MCP (scp equivalent)
+
+`read_file` and `write_file` move file *content* through the conversation, which
+rules out binaries and truncates anything large. `upload_file` and
+`download_file` stream between disk and the remote host instead:
+
+```jsonc
+// upload_file
+{ "server": "gcloud-work", "local_path": "./dist/app.tar.gz",
+  "remote_path": "/srv/releases/", "overwrite": true }
+
+// download_file
+{ "server": "prod1", "remote_path": "/var/log/nginx",
+  "local_path": "./logs/", "recursive": true }
+```
+
+Behaviour:
+
+- **scp destination semantics** — when the destination is an existing
+  directory, the source's base name is created inside it.
+- **`recursive`** is required for directories; passing one without it is an
+  error rather than a silent partial copy. Irregular files (sockets, devices,
+  symlinks) are skipped rather than guessed at.
+- **`overwrite` defaults to false**, so a call cannot clobber an existing file
+  by accident. The caller opts in.
+- **Permissions are preserved** in both directions. On download the mode is
+  applied at creation, so a fetched private key is never briefly
+  world-readable.
+- **Cancellable** — copying checks the request context between chunks, so a
+  stalled or oversized transfer can be abandoned. Failures report how much had
+  already been written.
+- Parent directories are created as needed.
+
+### 9. Test Connectivity & Latency
 ```bash
 # Test all configured servers
 kgssh test
@@ -188,7 +222,7 @@ kgssh test
 kgssh test prod1 -t 10
 ```
 
-### 9. View Operational Context & Playbooks
+### 10. View Operational Context & Playbooks
 ```bash
 # Overview of all servers
 kgssh info
@@ -197,7 +231,7 @@ kgssh info
 kgssh info agentic-stage
 ```
 
-### 10. Run as Model Context Protocol (MCP) Server
+### 11. Run as Model Context Protocol (MCP) Server
 ```bash
 # Start MCP server over stdio
 kgssh mcp
